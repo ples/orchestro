@@ -1,0 +1,32 @@
+# env files
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+
+# virtual env
+.venv/
+venv/
+venv DO NOT USE THIS ONE
+.env/
+
+# node
+node_modules/
+
+# cache
+.ruff_cache/
+.pytest_cache/
+
+# openhands workspace
+workspace/
+.openhands/

@@ -1,0 +1,17 @@
+services:
+  openhands:
+    image: docker.openhands.dev/openhands/openhands:1.7.0
+    ports:
+      - "3006:3000"
+    environment:
+      - LLM_MODEL=openai/Qwen3.6-35B-A3B-UD-MLX-4bit
+      - LLM_API_KEY=zaqw
+      - LLM_BASE_URL=http://host.docker.internal:8555/v1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ~/.openhands:/.openhands
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  workspace:
