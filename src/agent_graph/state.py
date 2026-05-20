@@ -11,6 +11,8 @@ WorkflowNodeType = Literal[
     "error",
 ]
 
+SourcePlatform = Literal["github", "bitbucket", "jira"]
+
 
 class TaskState(TypedDict, total=False):
     """Task state for the LangGraph workflow.
@@ -29,7 +31,10 @@ class TaskState(TypedDict, total=False):
     diff_patch: str
     change_stat: str
     pr_skip_reason: str
+    source_platform: SourcePlatform
     github_issue_url: str
+    jira_issue_url: str
+    bitbucket_issue_url: str
     pr_url: str
     pr_error: str
     chat_id: str
