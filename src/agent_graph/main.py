@@ -3,22 +3,33 @@
 import argparse
 import asyncio
 import os
+import re
 import sys
 
 from dotenv import load_dotenv
 
 from agent_graph.agents.bitbucket_fetcher import BitbucketFetcher
-from agent_graph.agents.executor import ExecutorAgent
 from agent_graph.agents.github_fetcher import GitHubFetcher
 from agent_graph.agents.jira_fetcher import JiraFetcher
 from agent_graph.agents.planner import PlannerAgent
-from agent_graph.agents.pr_creator import PrCreatorAgent
 from agent_graph.agents.verifier import VerifierAgent
 from agent_graph.cli_output import print_final_result
 from agent_graph.graph_builder import build_graph
 from agent_graph.state import TaskState
 
+
 load_dotenv()
+
+
+def _parse_repos(value: str | None) -> list[str]:
+    """Parse comma-separated or single repo URLs from --repo."""
+    if not value:
+        return []
+    return [r.strip() for r in value.split(",") if r.strip()]
+
+
+def _build_target_repos(urls: list[str]) -> list[dict]:
+    return [{"target_repo_path": url} for url in urls]
 
 
 def cli():
@@ -35,7 +46,7 @@ def cli():
         "--repo",
         type=str,
         default=None,
-        help="Target repository path or URL to modify",
+        help="Target repository path(s) — comma-separated for multiple repos",
     )
     parser.add_argument(
         "--github",
@@ -82,8 +93,12 @@ def cli():
     github_url = ""
     bitbucket_url = ""
     jira_url = ""
-    target_repo = args.repo or os.getenv("TARGET_REPO_PATH", "")
     source_platform = "github"
+    jira_issue_key = None
+    bb_issue_id = None
+
+    # --repo flag always adds to target_repos
+    cli_repos = _parse_repos(args.repo)
 
     if args.jira:
         source_platform = "jira"
@@ -100,9 +115,15 @@ def cli():
 
         if jira_project and not jql_query:
             jql_query = jira_fetcher.suggest_jql(jira_project)
-            print(f"\nUsing JQL: {jql_query}")
 
-        print(f"\nFetching Jira issues...")
+        if args.issue:
+            try:
+                selected_key, _ = JiraFetcher.parse_jira_url(args.issue)
+                jira_issue_key = selected_key
+            except ValueError:
+                jira_issue_key = args.issue
+
+        print("\nFetching Jira issues...")
         try:
             issues = jira_fetcher.fetch_issues(jql_query)
         except RuntimeError as e:
@@ -111,14 +132,14 @@ def cli():
 
         print(f"Found {len(issues)} issues.\n")
 
-        if issue_number is not None:
+        if jira_issue_key is not None:
             selected = None
             for issue in issues:
-                if issue.key == issue_number:
+                if issue.key == jira_issue_key:
                     selected = issue
                     break
             if not selected:
-                print(f"Error: Issue {issue_number} not found or does not match.")
+                print(f"Error: Issue {jira_issue_key} not found or does not match.")
                 return
             issue_text = f"{selected.key}: {selected.title}\n\n{selected.body}" if selected.body else f"{selected.key}: {selected.title}"
             jira_url = selected.url
@@ -153,8 +174,17 @@ def cli():
                 return
             owner, repo = parts
 
-        if not target_repo:
-            target_repo = f"https://bitbucket.org/{owner}/{repo}.git"
+        if args.issue:
+            try:
+                match = re.match(r"#(\d+)", args.issue.strip())
+                if match:
+                    bb_issue_id = int(match.group(1))
+            except ValueError:
+                pass
+
+        if not cli_repos:
+            bb_url = f"https://bitbucket.org/{owner}/{repo}.git"
+            cli_repos = [bb_url]
 
         print(f"\nFetching open issues from {owner}/{repo}...")
         try:
@@ -165,16 +195,16 @@ def cli():
 
         print(f"Found {len(issues)} issues.\n")
 
-        if issue_number is not None:
+        if bb_issue_id is not None:
             selected = None
             for issue in issues:
-                if issue.id == issue_number:
+                if issue.id == bb_issue_id:
                     selected = issue
                     break
             if not selected:
-                print(f"Error: Issue #{issue_number} not found or not open.")
+                print(f"Error: Issue #{bb_issue_id} not found or not open.")
                 return
-            issue_text = f"#{issue_number}: {selected.title}\n\n{selected.body}" if selected.body else f"#{issue_number}: {selected.title}"
+            issue_text = f"#{selected.id}: {selected.title}\n\n{selected.body}" if selected.body else f"#{selected.id}: {selected.title}"
             bitbucket_url = selected.url
         else:
             try:
@@ -210,8 +240,8 @@ def cli():
             owner, repo = parts
             issue_number = None
 
-        if not target_repo:
-            target_repo = f"https://github.com/{owner}/{repo}.git"
+        if not cli_repos:
+            cli_repos = [f"https://github.com/{owner}/{repo}.git"]
 
         print(f"\nFetching open issues from {owner}/{repo}...")
         try:
@@ -242,23 +272,22 @@ def cli():
             github_url = selected.url
 
     planner = PlannerAgent()
-    executor = ExecutorAgent()
     verifier = VerifierAgent()
-    pr_creator = PrCreatorAgent()
 
     app = build_graph(
         planner_fn=planner.run,
-        executor_fn=executor.run,
         verifier_fn=verifier.run,
-        pr_creator_fn=pr_creator.run,
+        source_platform=source_platform,
     )
+
+    target_repos = _build_target_repos(cli_repos)
 
     initial_state: TaskState = {
         "issue": issue_text,
         "plan": "",
         "implementation_result": "",
         "verification_result": "",
-        "target_repo_path": target_repo,
+        "target_repo_path": "",
         "work_repo_path": "",
         "repo_baseline_sha": "",
         "diff_patch": "",
@@ -270,6 +299,7 @@ def cli():
         "pr_url": "",
         "pr_error": "",
         "pr_skip_reason": "",
+        "target_repos": target_repos,
     }
 
     result = app.invoke(initial_state)
@@ -291,16 +321,12 @@ def telegram_cli():
     # Build graph builder
     def _graph_builder():
         planner = PlannerAgent()
-        executor = ExecutorAgent()
         verifier = VerifierAgent()
-
-        pr_creator = PrCreatorAgent()
 
         return build_graph(
             planner_fn=planner.run,
-            executor_fn=executor.run,
             verifier_fn=verifier.run,
-            pr_creator_fn=pr_creator.run,
+            source_platform="github",
         )
 
     bot.register_graph_builder(_graph_builder)
@@ -315,6 +341,7 @@ def telegram_cli():
     finally:
         loop.run_until_complete(bot.cleanup())
         loop.close()
+
 
 if __name__ == "__main__":
     cli()

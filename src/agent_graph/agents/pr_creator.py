@@ -1,9 +1,10 @@
 """Creates a pull request from the executor worktree (GitHub, Bitbucket)."""
 
+import contextlib
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime
 
 from agent_graph.agents.bitbucket_fetcher import BitbucketFetcher
 from agent_graph.agents.github_fetcher import GitHubFetcher
@@ -69,7 +70,7 @@ class PrCreatorAgent(BaseAgent):
         branch = (
             f"agent/issue-{issue_number}"
             if issue_number
-            else f"agent/run-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+            else f"agent/run-{datetime.now(datetime.UTC).strftime('%Y%m%d%H%M%S')}"
         )
 
         auth_remote = (
@@ -153,11 +154,7 @@ class PrCreatorAgent(BaseAgent):
             return self._create_github_pr(
                 state, work_repo_path, baseline_sha, target_repo, github_issue_url
             )
-        elif platform == "bitbucket":
-            return self._create_bitbucket_pr(
-                state, work_repo_path, baseline_sha, target_repo, bitbucket_issue_url, github_issue_url, jira_issue_url
-            )
-        elif platform == "jira":
+        elif platform == "bitbucket" or platform == "jira":
             return self._create_bitbucket_pr(
                 state, work_repo_path, baseline_sha, target_repo, bitbucket_issue_url, github_issue_url, jira_issue_url
             )
@@ -218,7 +215,7 @@ class PrCreatorAgent(BaseAgent):
         branch = (
             f"agent/issue-{issue_number}"
             if issue_number
-            else f"agent/run-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+            else f"agent/run-{datetime.now(datetime.UTC).strftime('%Y%m%d%H%M%S')}"
         )
 
         auth_remote = (
@@ -278,7 +275,7 @@ class PrCreatorAgent(BaseAgent):
         branch = (
             f"agent/issue-{identifier}"
             if identifier
-            else f"agent/run-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+            else f"agent/run-{datetime.now(datetime.UTC).strftime('%Y%m%d%H%M%S')}"
         )
 
         auth_remote = (
@@ -314,7 +311,7 @@ class PrCreatorAgent(BaseAgent):
             body = self._pr_body(state, None, platform="bitbucket")
             issue_id = None
             if identifier:
-                match = re.search(r"-(\d+)$", identifier)
+                match = re.search(r"-(\d+)$", str(identifier))
                 if match:
                     issue_id = match.group(1)
             pr_url = fetcher.create_pull_request(
@@ -322,10 +319,8 @@ class PrCreatorAgent(BaseAgent):
             )
             # Update PR with issue references via id comment if possible
             if issue_id:
-                try:
+                with contextlib.suppress(Exception):
                     self._git(work_repo_path, "-C", work_repo_path, "checkout", "-q", "-b", f"bb-linked-{issue_id}-pr")
-                except (subprocess.CalledProcessError, Exception):
-                    pass
         except RuntimeError as e:
             print(f"  PR API error: {e}")
             return {"pr_url": "", "pr_error": str(e), "pr_skip_reason": ""}

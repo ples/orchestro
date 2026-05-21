@@ -1,5 +1,7 @@
 """Tests for graph builder."""
 
+from unittest.mock import patch
+
 from agent_graph.graph_builder import _pr_router, build_graph
 from agent_graph.state import TaskState
 
@@ -35,15 +37,25 @@ def test_pr_router_failed():
 
 
 def test_build_graph_compiles():
-    def mock_pr_creator(state: dict) -> dict:
+    def mock_pr_creator(_state: dict) -> dict:
         return {"pr_url": "https://github.com/o/r/pull/1", "pr_error": ""}
 
-    graph = build_graph(pr_creator_fn=mock_pr_creator)
+    def mock_executor_loop(_state: dict) -> dict:
+        return {"target_repos": []}
+
+    graph = build_graph(
+        executor_loop_fn=mock_executor_loop,
+        pr_creator_fn=mock_pr_creator,
+    )
     assert graph is not None
+    nodes = [k for k in graph.nodes.keys() if not k.startswith("__")]
+    assert "planner" in nodes
+    assert "executor_loop" in nodes
+    assert "pr_aggregator" in nodes
 
     state: TaskState = {
         "issue": "add feature X",
-        "plan": "",
+        "plan": "plan",
         "implementation_result": "",
         "verification_result": "",
         "target_repo_path": "https://github.com/o/r.git",
@@ -52,6 +64,7 @@ def test_build_graph_compiles():
         "github_issue_url": "",
         "pr_url": "",
         "pr_error": "",
+        "target_repos": [{"target_repo_path": "https://github.com/o/r.git"}],
     }
 
     result = graph.invoke(state)

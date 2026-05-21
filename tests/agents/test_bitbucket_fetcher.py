@@ -102,7 +102,7 @@ class TestGetDefaultBranch:
         with patch.object(requests, "get", return_value=mock_response) as mock_get:
             branch = fetcher.get_default_branch("acme", "myapp")
             assert branch == "main"
-            assert mock_get.call_args[0][1] == "https://api.bitbucket.org/2.0/repos/acme/myapp/refs/branches"
+            assert mock_get.call_args[1]["params"] == {"sort": "target.date"}
 
     def test_get_default_branch_first_fallback(self):
         fetcher = BitbucketFetcher(token="fake")

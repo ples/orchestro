@@ -116,7 +116,6 @@ class BitbucketFetcher:
             "pagelen": min(per_page, 100),
             "sort": "-created",
         }
-        # Use token auth for Bitbucket
         resp = requests.get(
             url,
             headers=self._headers(),
@@ -130,7 +129,6 @@ class BitbucketFetcher:
         data = resp.json()
         issues = []
         for item in data.get("values", []):
-            reporter = item.get("reporter")
             assignee_data = item.get("assignee")
             if not assignee_data:
                 assignee_data = item.get("user")
@@ -152,7 +150,6 @@ class BitbucketFetcher:
                 priority = None
                 issue_url = item.get("links", {}).get("html", {}).get("href", "")
 
-            # Skip closed issues that are just artifacts
             issues.append(BitbucketIssue(
                 id=item.get("id"),
                 title=title,

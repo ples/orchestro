@@ -40,6 +40,7 @@ def _empty_task_state(chat_id: int | str) -> TaskState:
         "pr_url": "",
         "pr_error": "",
         "pr_skip_reason": "",
+        "target_repos": [],
         "chat_id": str(chat_id),
         "workflow_node": "idle",
     }
@@ -247,10 +248,6 @@ class TelegramBot:
             result = await loop.run_in_executor(None, lambda: graph_fn.invoke(state))
 
         async with session.state_lock:
-            if result.get("pr_error"):
-                result["workflow_node"] = "completed"
-            else:
-                result["workflow_node"] = "completed"
             session.state.update(result)
 
         await self._notify_chat(session, session.chat_id)

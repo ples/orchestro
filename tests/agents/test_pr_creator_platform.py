@@ -9,6 +9,9 @@ from agent_graph.agents.pr_creator import PrCreatorAgent
 from agent_graph.state import TaskState
 
 
+PR_CREATOR_MODULE = "agent_graph.agents.pr_creator"
+
+
 class TestPrCreatorBitbucketPR:
     def _create_state(self, **overrides):
         state: TaskState = {
@@ -41,7 +44,9 @@ class TestPrCreatorBitbucketPR:
         bb_mock.create_pull_request.return_value = "https://bitbucket.org/acme/myapp/pull-requests/1"
 
         with patch.object(agent, "_git"), \
-             patch(f"{type(agent).__module__}.bitbucket_fetcher.BitbucketFetcher", return_value=bb_mock):
+             patch(f"{PR_CREATOR_MODULE}.BitbucketFetcher") as bb_cls:
+            bb_cls.parse_repo_remote.return_value = ("acme", "myapp")
+            bb_cls.return_value = bb_mock
             result = agent._create_bitbucket_pr(
                 state,
                 work_repo_path=state["work_repo_path"],
@@ -57,14 +62,32 @@ class TestPrCreatorBitbucketPR:
 
     def test_bitbucket_pr_no_workspace(self):
         agent = PrCreatorAgent()
-        state = self._create_state(work_repo_path="")
-        with pytest.raises(RuntimeError, match="GITHUB_TOKEN is required"):
-            agent._create_bitbucket_pr(
-                state, work_repo_path="", baseline_sha="", target_repo="",
-                bitbucket_issue_url="", github_issue_url="", jira_issue_url="",
-            )
+        # When work_repo_path is empty, _execute() returns early with pr_skip_reason
+        state: TaskState = {
+            "issue": "test",
+            "plan": "",
+            "implementation_result": "",
+            "verification_result": "",
+            "target_repo_path": "",
+            "work_repo_path": "",
+            "repo_baseline_sha": "",
+            "diff_patch": "",
+            "change_stat": "",
+            "github_issue_url": "",
+            "jira_issue_url": "",
+            "bitbucket_issue_url": "",
+            "source_platform": "bitbucket",
+            "pr_url": "",
+            "pr_error": "",
+            "pr_skip_reason": "",
+            "workflow_node": "pr_creating",
+        }
+        with patch.dict("os.environ", {"BITBUCKET_TOKEN": "fake"}):
+            result = agent._execute(state)
+            assert result["pr_skip_reason"] == "No work repository path from executor."
+            assert result["pr_error"] == ""
 
-    def test_bitbucket_pr_no_pass_workdir_to_git(self):
+    def test_bitbucket_pr_no_workdir_to_git(self):
         """Verify that _resolve_owner_repo passes the right source URLs to BitbucketFetcher."""
         agent = PrCreatorAgent()
         state = self._create_state()
@@ -105,8 +128,9 @@ class TestPrCreatorGitHubPR:
         gh_mock.create_pull_request.return_value = "https://github.com/acme/myapp/pull/42"
 
         with patch.object(agent, "_git"), \
-             patch(f"{type(agent).__module__}.github_fetcher.GitHubFetcher", return_value=gh_mock), \
-             patch.dict("os.environ", {"GITHUB_TOKEN": "fake"}):
+             patch(f"{PR_CREATOR_MODULE}.GitHubFetcher") as gh_cls:
+            gh_cls.parse_repo_remote.return_value = ("acme", "myapp")
+            gh_cls.return_value = gh_mock
             result = agent._create_github_pr(
                 state,
                 work_repo_path=state["work_repo_path"],

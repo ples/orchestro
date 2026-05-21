@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 from agent_graph.openhands_client import OpenHandsClient
+from agent_graph.agents.repo_detector import RepoDetectorAgent
 from agent_graph.state import TaskState
 
 from .base import BaseAgent
@@ -33,10 +34,27 @@ class PlannerAgent(BaseAgent):
             repo_info = self._parse_repo_url(github_url)
 
         repo_context = self._fetch_repo_context(state)
+        target_repos = state.get("target_repos", [])
 
-        plan = self._build_plan(issue, repo_info, repo_context)
+        # Detect deps if GITHUB_TOKEN present, otherwise continue
+        if target_repos:
+            for r in target_repos:
+                url = r.get("target_repo_path", "")
+                print(f"  [Planner] Target repo: {url}")
 
-        return {"plan": plan, "repo_context": repo_context}
+        if not target_repos:
+            det = RepoDetectorAgent()
+            target_repos = det.run(state).get("target_repos", [])
+
+        if target_repos:
+            for r in target_repos:
+                url = r.get("target_repo_path", "")
+                print(f"  [Planner] Detected repo: {url}")
+            repo_context = self._update_repo_context(repo_context, target_repos)
+
+        plan = self._build_plan(issue, repo_info, repo_context, target_repos)
+
+        return {"plan": plan, "repo_context": repo_context, "target_repos": target_repos}
 
     def _fetch_repo_context(self, state: TaskState) -> str:
         """Clone (if needed) and analyse the repository structure + dependencies."""
@@ -256,6 +274,19 @@ class PlannerAgent(BaseAgent):
                 hits.add(c)
         return hits
 
+    @staticmethod
+    def _update_repo_context(repo_context: str, target_repos: list | None = None) -> str:
+        """Append repo list to existing repo_context."""
+        if not target_repos:
+            return repo_context
+        lines = []
+        lines.append("## Target Repositories")
+        for r in target_repos:
+            url = r.get("target_repo_path", "") if isinstance(r, dict) else r
+            lines.append(f"- {url}")
+        lines.append("")
+        return repo_context + "\n" + "\n".join(lines)
+
     # ------------------------------------------------------------------
 
     def _parse_repo_url(self, url: str) -> str:
@@ -270,7 +301,7 @@ class PlannerAgent(BaseAgent):
                 return f"{match.group(1)}/{match.group(2)}"
         return ""
 
-    def _build_plan(self, issue: str, repo_info: str, repo_context: str) -> str:
+    def _build_plan(self, issue: str, repo_info: str, repo_context: str, target_repos: list | None = None) -> str:
         """Generate implementation plan with repo context."""
         lines = []
         lines.append("=== PLAN ===")
@@ -278,6 +309,14 @@ class PlannerAgent(BaseAgent):
         lines.append(repo_context)
         lines.append("")
         lines.append("Implementation steps:")
+
+        if target_repos:
+            lines.append("")
+            repos_str = "\n".join(f"  {r}" for r in target_repos)
+            lines.append(f"## Target repositories ({len(target_repos)})")
+            for r in target_repos:
+                url = r.get("target_repo_path", "") if isinstance(r, dict) else r
+                lines.append(f"  - {url}")
 
         if repo_info:
             lines.append(f"1. Repository context: {repo_info}")

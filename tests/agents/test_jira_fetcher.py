@@ -158,7 +158,7 @@ class TestFetchIssue:
             assert issue.title == "Single issue"
             assert issue.assignee == "alice"
             assert issue.url == "https://test-site.atlassian.net/browse/PROJ-42"
-            assert mock_get.call_args[0][1] == "https://test-site.atlassian.net/rest/api/latest/issue/PROJ-42"
+            assert mock_get.call_args[1]["params"] == {"fields": "summary,status,assignee,priority,description"}
 
 
 class TestGetProjectKeys:
@@ -190,8 +190,8 @@ class TestPickIssue:
     def test_pick_issue_valid_choice(self, monkeypatch):
         fetcher = JiraFetcher(token="fake", site="test")
         issues = [
-            JiraIssue(key="PROJ-1", title="First", state="open", assignee="alice", body="body1", url="https://jira/browse/PROJ-1"),
-            JiraIssue(key="PROJ-2", title="Second", state="open", assignee=None, body="body2", url="https://jira/browse/PROJ-2"),
+            JiraIssue(key="PROJ-1", title="First", state="open", assignee="alice", body="body1", url="https://jira/browse/PROJ-1", project="PROJ"),
+            JiraIssue(key="PROJ-2", title="Second", state="open", assignee=None, body="body2", url="https://jira/browse/PROJ-2", project="PROJ"),
         ]
         monkeypatch.setattr("builtins.input", lambda _: "1")
         result = fetcher.pick_issue(issues)
@@ -199,7 +199,7 @@ class TestPickIssue:
 
     def test_pick_issue_keyboard_interrupt(self, monkeypatch):
         fetcher = JiraFetcher(token="fake", site="test")
-        issues = [JiraIssue(key="PROJ-1", title="First", state="open", assignee=None, body="", url="")]
+        issues = [JiraIssue(key="PROJ-1", title="First", state="open", assignee=None, body="", url="", project="PROJ")]
         monkeypatch.setattr("builtins.input", lambda _: "q")
         with pytest.raises(KeyboardInterrupt):
             fetcher.pick_issue(issues)

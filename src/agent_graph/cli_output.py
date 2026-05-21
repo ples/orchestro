@@ -55,6 +55,16 @@ def format_final_result(state: TaskState) -> str:
     if github:
         lines.append(_paint("GitHub", _C.BOLD) + f"    {github}")
 
+    target_repos = state.get("target_repos", [])
+    if target_repos:
+        lines.append(_paint("Repos", _C.BOLD))
+        for r in target_repos:
+            url = r.get("target_repo_path", "")
+            pr = r.get("pr_url", "")
+            err = r.get("pr_error", "")
+            status = f"  ✓ {pr}" if pr else f"  ✗ {err}" if err else ""
+            lines.append(f"  {url if not status else f'{url} {status}'}")
+
     impl = state.get("implementation_result", "")
     if impl:
         if "no file changes" in impl.lower() or "without editing" in impl.lower():
@@ -66,22 +76,21 @@ def format_final_result(state: TaskState) -> str:
     if verify:
         lines.append(_paint("Verifier", _C.BOLD) + f"  {verify}")
 
-    work_path = state.get("work_repo_path", "")
-    if work_path:
-        lines.append(_paint("Worktree", _C.BOLD) + f"  {_paint(work_path, _C.DIM)}")
-
-    baseline = state.get("repo_baseline_sha", "")
-    if baseline:
-        lines.append(
-            _paint("Baseline", _C.BOLD) + f"  {_paint(baseline[:12], _C.DIM)}"
-        )
-
-    diff_stat = state.get("change_stat", "")
-    if diff_stat:
-        lines.append("")
-        lines.append(_paint("Changes", _C.BOLD, _C.YELLOW))
-        for stat_line in diff_stat.splitlines():
-            lines.append(f"  {stat_line}")
+    for r in target_repos:
+        work_path = r.get("work_repo_path", "")
+        if work_path:
+            lines.append(_paint("Worktree", _C.BOLD) + f"  {_paint(work_path, _C.DIM)}")
+            baseline = r.get("repo_baseline_sha", "")
+            if baseline:
+                lines.append(
+                    _paint("Baseline", _C.BOLD) + f"  {_paint(baseline[:12], _C.DIM)}"
+                )
+            diff_stat = r.get("change_stat", "")
+            if diff_stat:
+                lines.append("")
+                lines.append(_paint("Changes", _C.BOLD, _C.YELLOW))
+                for stat_line in diff_stat.splitlines():
+                    lines.append(f"  {stat_line}")
 
     lines.append("")
     pr_url = state.get("pr_url", "")
@@ -90,10 +99,12 @@ def format_final_result(state: TaskState) -> str:
 
     if pr_url:
         lines.append(_paint("✓ Pull request created", _C.BOLD, _C.GREEN))
-        lines.append(f"  {pr_url}")
+        for url in pr_url.split("\n"):
+            lines.append(f"  {url}")
     elif pr_error:
         lines.append(_paint("✗ PR creation failed", _C.BOLD, _C.RED))
-        lines.append(f"  {pr_error}")
+        for err in pr_error.split("\n"):
+            lines.append(f"  {err}")
     elif skip:
         lines.append(_paint("○ PR skipped", _C.BOLD, _C.YELLOW))
         for skip_line in skip.split("\n"):

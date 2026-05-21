@@ -10,43 +10,55 @@ def build_graph(
     executor_fn: Callable[[TaskState], dict] | None = None,
     verifier_fn: Callable[[TaskState], dict] | None = None,
     pr_creator_fn: Callable[[TaskState], dict] | None = None,
+    repo_resolver_fn: Callable[[TaskState], dict] | None = None,
+    executor_loop_fn: Callable[[TaskState], dict] | None = None,
+    source_platform: str = "github",
 ) -> StateGraph:
-    """Build and compile the agent workflow graph.
-
-    Args:
-        planner_fn: Function that takes state and returns plan updates.
-        executor_fn: Function that takes state and returns execution updates.
-        verifier_fn: Function that takes state and returns verification updates.
-        pr_creator_fn: Function that commits, pushes, and opens a GitHub PR.
-
-    Returns:
-        Compiled StateGraph ready for invocation.
-    """
     graph = StateGraph(TaskState)
 
+    needs_repo_resolver = source_platform in ("jira", "bitbucket")
+
+    if needs_repo_resolver:
+        repo_resolver = repo_resolver_fn or _default_repo_resolver
+        graph.add_node("repo_resolver", repo_resolver)
+        graph.set_entry_point("repo_resolver")
+        graph.add_edge("repo_resolver", "planner")
+    else:
+        graph.set_entry_point("planner")
+
     planner = planner_fn or _default_planner
-    executor = executor_fn or _default_executor
+    executor_loop = executor_loop_fn or _default_executor_loop
     verifier = verifier_fn or _default_verifier
     pr_creator = pr_creator_fn or _default_pr_creator
 
     graph.add_node("planner", planner)
-    graph.add_node("executor", executor)
+    graph.add_node("executor_loop", executor_loop)
     graph.add_node("verifier", verifier)
-    graph.add_node("pr_creator", pr_creator)
+    graph.add_node("pr_aggregator", pr_creator)
 
-    graph.set_entry_point("planner")
-
-    graph.add_edge("planner", "executor")
-    graph.add_edge("executor", "verifier")
-    graph.add_edge("verifier", "pr_creator")
+    graph.add_edge("planner", "executor_loop")
+    graph.add_edge("executor_loop", "verifier")
+    graph.add_edge("verifier", "pr_aggregator")
 
     graph.add_conditional_edges(
-        "pr_creator",
+        "pr_aggregator",
         _pr_router,
         {"done": END, "failed": END},
     )
 
     return graph.compile()
+
+
+def _default_repo_resolver(state: TaskState) -> dict:
+    from agent_graph.agents.repo_resolver import RepoResolverAgent
+
+    return RepoResolverAgent().run(state)
+
+
+def _default_executor_loop(state: TaskState) -> dict:
+    from agent_graph.agents.executor_loop import ExecutorLoopAgent
+
+    return ExecutorLoopAgent().run(state)
 
 
 def _default_planner(state: TaskState) -> dict:
@@ -86,9 +98,9 @@ def _default_verifier(state: TaskState) -> dict:
 
 
 def _default_pr_creator(state: TaskState) -> dict:
-    from agent_graph.agents.pr_creator import PrCreatorAgent
+    from agent_graph.agents.pr_aggregator import PrAggregatorAgent
 
-    return PrCreatorAgent().run(state)
+    return PrAggregatorAgent().run(state)
 
 
 def _pr_router(state: TaskState) -> str:
