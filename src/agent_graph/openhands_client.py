@@ -2,10 +2,10 @@
 
 import os
 import platform
-import subprocess
 
 import requests
 from openhands.sdk import LLM, Agent, Conversation, Tool
+from openhands.sdk.conversation.exceptions import ConversationRunError
 from openhands.sdk.utils.command import execute_command
 from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.terminal import TerminalTool
@@ -17,12 +17,87 @@ from agent_graph.git_utils import (
     change_summary,
     diff_stat_since,
     has_changes_since,
-    rev_parse,
 )
-from agent_graph.models import ExecutionResult
+from agent_graph.mcp.config import build_openhands_mcp_config
+from agent_graph.models import ExecutionResult, PlanningResult
+from agent_graph.repo_clone import clone_repository, reset_repo_to_baseline
 
 DEFAULT_SERVER_IMAGE = "ghcr.io/openhands/agent-server:1.21.1-python"
 LLM_ENV_KEYS = ("LLM_MODEL", "LLM_API_KEY", "LLM_BASE_URL")
+DEFAULT_PLANNER_MAX_ITERATIONS = 20
+DEFAULT_EXECUTOR_MAX_ITERATIONS = 500
+
+
+def reuse_agent_server() -> bool:
+    raw = os.getenv("OPENHANDS_REUSE_AGENT_SERVER", "1").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
+class AgentServerSession:
+    """One agent-server container; run multiple OpenHands conversations on it."""
+
+    def __init__(
+        self,
+        client: "OpenHandsClient",
+        volume_mounts: list[tuple[str, str]],
+        *,
+        skip_health_checks: bool = False,
+    ):
+        self._client = client
+        self._volume_mounts = [
+            (os.path.abspath(host), name) for host, name in volume_mounts
+        ]
+        self._skip_health_checks = skip_health_checks
+        self._workspace: DockerWorkspace | None = None
+        self._env_backup: dict[str, str | None] | None = None
+        self._health_checked = False
+
+    def start(self) -> None:
+        if self._workspace is not None:
+            return
+        if not self._volume_mounts:
+            raise RuntimeError("AgentServerSession requires at least one volume mount")
+
+        volumes = [
+            f"{host}:/workspace/{name}" for host, name in self._volume_mounts
+        ]
+        self._env_backup = self._client._apply_container_llm_env()
+        self._workspace = DockerWorkspace(
+            server_image=self._client.server_image,
+            platform=self._client._detect_platform(),
+            working_dir="/workspace",
+            forward_env=list(LLM_ENV_KEYS),
+            volumes=volumes,
+        )
+        print(
+            f"  Agent server (shared): {self._workspace.host} "
+            f"({len(self._volume_mounts)} repo mount(s))"
+        )
+
+        if self._skip_health_checks:
+            return
+        if not self._client._check_docker_available():
+            raise RuntimeError("Docker is not available")
+        if not self._client._check_llm_health():
+            raise RuntimeError("LLM endpoint not reachable")
+        if not self._client._check_llm_health_in_container(self._workspace):
+            raise RuntimeError("LLM not reachable from agent-server container")
+        self._health_checked = True
+
+    def stop(self) -> None:
+        if self._workspace is not None:
+            self._workspace.cleanup()
+            self._workspace = None
+        if self._env_backup is not None:
+            self._client._restore_env(self._env_backup)
+            self._env_backup = None
+
+    @property
+    def workspace(self) -> DockerWorkspace:
+        if self._workspace is None:
+            msg = "Agent server session not started; call start() first"
+            raise RuntimeError(msg)
+        return self._workspace
 
 
 class OpenHandsClient:
@@ -46,97 +121,190 @@ class OpenHandsClient:
             "OPENHANDS_SERVER_IMAGE", DEFAULT_SERVER_IMAGE
         )
 
-    def _ensure_repo_in_agent(self, target_repo: str) -> tuple[str, str]:
-        """Clone or copy a target repo into a temp directory on the host.
+    @staticmethod
+    def _planner_max_iterations() -> int:
+        raw = os.getenv("PLANNER_MAX_ITERATIONS", "").strip()
+        if raw.isdigit():
+            return int(raw)
+        return DEFAULT_PLANNER_MAX_ITERATIONS
 
-        Returns:
-            (repo_path, baseline_sha) where baseline_sha is HEAD after setup.
-        """
-        tmp_dir = subprocess.check_output(
-            ["mktemp", "-d", "-t", "openhands_repo_"], text=True
-        ).strip()
+    @staticmethod
+    def _executor_max_iterations() -> int:
+        raw = os.getenv("EXECUTOR_MAX_ITERATIONS", "").strip()
+        if raw.isdigit():
+            return int(raw)
+        return DEFAULT_EXECUTOR_MAX_ITERATIONS
 
-        if target_repo:
-            is_remote = (
-                target_repo.startswith("http://")
-                or target_repo.startswith("https://")
-                or target_repo.startswith("git@")
+    def _prepare_repo(
+        self,
+        target_repo: str,
+        *,
+        existing_repo_path: str | None = None,
+        baseline_sha: str | None = None,
+        clone_prefix: str = "openhands_repo_",
+    ) -> tuple[str, str]:
+        if existing_repo_path and os.path.isdir(existing_repo_path):
+            repo_path = existing_repo_path
+            base = baseline_sha or ""
+            if base:
+                reset_repo_to_baseline(repo_path, base)
+            return repo_path, base
+
+        if not target_repo:
+            return "", ""
+
+        try:
+            return clone_repository(target_repo, prefix=clone_prefix)
+        except ExecutorError:
+            raise
+        except OSError as exc:
+            raise ExecutorError(str(exc)) from exc
+
+    def run_cross_repo_planning(
+        self,
+        issue: str,
+        combined_context: str,
+        *,
+        input_prompt: str = "",
+    ) -> str:
+        """Big-picture analysis across all cloned repositories (local LLM)."""
+        if not combined_context.strip():
+            return ""
+        task = self._format_task_for_prompt(issue, input_prompt)
+        prompt = (
+            f"# Task\n\nIssue: {task}\n\n"
+            f"# All target repositories (cloned)\n\n{combined_context}\n\n"
+            f"# Instructions\n\n"
+            f"1. Follow developer instructions when they narrow or expand scope beyond the ticket.\n"
+            f"2. Explain how these repositories relate to the issue.\n"
+            f"3. Identify which repo(s) likely need code changes and why.\n"
+            f"4. Note shared APIs, types, or data flows between repos.\n"
+            f"5. End with exactly these sections:\n\n"
+            f"## Cross-repo findings\n\n"
+            f"## Repo roles\n"
+            f"(bullet per repository)\n\n"
+            f"## Suggested per-repo focus\n"
+            f"(what each repo analysis should prioritize)\n"
+        )
+        return self._plan_with_local_llm(prompt)
+
+    def run_planning_task(
+        self,
+        *,
+        target_repo: str,
+        issue: str,
+        static_context: str = "",
+        existing_repo_path: str | None = None,
+        baseline_sha: str | None = None,
+        skip_health_checks: bool = False,
+        big_picture: str = "",
+        input_prompt: str = "",
+        session: AgentServerSession | None = None,
+    ) -> PlanningResult:
+        try:
+            repo_path, base = self._prepare_repo(
+                target_repo,
+                existing_repo_path=existing_repo_path,
+                baseline_sha=baseline_sha,
+                clone_prefix="planner_repo_",
             )
-            if is_remote:
-                repo_name = target_repo.rstrip("/").split("/")[-1].replace(".git", "")
-                repo_path = os.path.join(tmp_dir, repo_name)
-                clone_url = self._authenticated_git_url(target_repo)
-                subprocess.run(
-                    ["git", "clone", "--depth", "1", clone_url, repo_path],
-                    check=True,
-                    capture_output=True,
-                )
-                subprocess.run(
-                    ["git", "-C", repo_path, "add", "."],
-                    check=False,
-                    capture_output=True,
-                )
-                subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        repo_path,
-                        "commit",
-                        "-m",
-                        "initial",
-                        "--allow-empty-message",
-                    ],
-                    check=False,
-                    capture_output=True,
-                )
-            else:
-                if not os.path.isdir(target_repo):
-                    raise ExecutorError(f"Target repo not found: {target_repo}")
-                repo_name = os.path.basename(target_repo)
-                repo_path = os.path.join(tmp_dir, repo_name)
-                subprocess.run(
-                    ["cp", "-R", f"{target_repo}/.", repo_path],
-                    check=True,
-                    capture_output=True,
-                )
-                subprocess.run(
-                    ["git", "-C", repo_path, "add", "."],
-                    check=False,
-                    capture_output=True,
-                )
-                subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        repo_path,
-                        "commit",
-                        "-m",
-                        "initial",
-                        "--allow-empty-message",
-                    ],
-                    check=False,
-                    capture_output=True,
-                )
-            baseline = rev_parse(repo_path)
-            return repo_path, baseline
+        except ExecutorError as exc:
+            return PlanningResult(success=False, summary=str(exc))
 
-        return "", ""
+        if not repo_path:
+            return PlanningResult(
+                success=False,
+                summary="No repository path available for planning",
+            )
+
+        workspace_dir = f"/workspace/{os.path.basename(repo_path)}"
+        prompt = self._build_planning_prompt(
+            issue,
+            static_context,
+            workspace_dir,
+            big_picture=big_picture,
+            input_prompt=input_prompt,
+        )
+
+        if os.getenv("PLANNER_USE_OPENHANDS", "").lower() not in ("1", "true", "yes"):
+            summary = self._plan_with_local_llm(prompt)
+            if summary:
+                reset_repo_to_baseline(repo_path, base)
+                return PlanningResult(
+                    success=True,
+                    summary=summary,
+                    planner_clone_path=repo_path,
+                    repo_baseline_sha=base,
+                )
+            return PlanningResult(
+                success=False,
+                summary="Local LLM planning failed",
+                planner_clone_path=repo_path,
+                repo_baseline_sha=base,
+            )
+
+        result = self._execute_in_docker_workspace(
+            repo_path,
+            workspace_dir,
+            prompt,
+            base,
+            mode="planning",
+            skip_health_checks=skip_health_checks or session is not None,
+            check_changes=False,
+            session=session,
+        )
+
+        reset_repo_to_baseline(repo_path, base)
+
+        if not result.success:
+            return PlanningResult(
+                success=False,
+                summary=result.summary,
+                planner_clone_path=repo_path,
+                repo_baseline_sha=base,
+            )
+
+        return PlanningResult(
+            success=True,
+            summary=result.summary,
+            planner_clone_path=repo_path,
+            repo_baseline_sha=base,
+        )
 
     def run_task(
         self,
         target_repo: str,
         issue: str,
         plan: str,
+        existing_repo_path: str | None = None,
+        baseline_sha: str | None = None,
+        skip_health_checks: bool = False,
+        input_prompt: str = "",
+        session: AgentServerSession | None = None,
     ) -> ExecutionResult:
-        repo_path, baseline_sha = self._ensure_repo_in_agent(target_repo)
+        try:
+            repo_path, base = self._prepare_repo(
+                target_repo,
+                existing_repo_path=existing_repo_path,
+                baseline_sha=baseline_sha,
+            )
+        except ExecutorError as exc:
+            return ExecutionResult(success=False, summary=str(exc))
+
         workspace_dir = (
             f"/workspace/{os.path.basename(repo_path)}" if repo_path else "/workspace"
         )
-        prompt = self._build_prompt(issue, plan, workspace_dir)
+        prompt = self._build_prompt(issue, plan, workspace_dir, input_prompt=input_prompt)
 
         try:
             return self._execute_in_docker_workspace(
-                repo_path, workspace_dir, prompt, baseline_sha
+                repo_path,
+                workspace_dir,
+                prompt,
+                base,
+                mode="execution",
+                skip_health_checks=skip_health_checks or session is not None,
+                session=session,
             )
         except Exception as e:
             return ExecutionResult(
@@ -144,9 +312,142 @@ class OpenHandsClient:
                 summary=f"OpenHands task failed: {e}",
             )
 
-    def _build_prompt(
-        self, issue: str, plan: str, workspace_dir: str
+    def check_runtime_ready(self) -> str | None:
+        """Return an error message if Docker or LLM is unavailable."""
+        if not self._check_docker_available():
+            return "Docker is not available. Start Docker Desktop and retry."
+        if not self._check_llm_health():
+            return "LLM endpoint not reachable. Start local endpoint first."
+        return None
+
+    def _plan_with_local_llm(self, prompt: str) -> str:
+        """Run read-only planning via direct chat completion (no OpenHands agent loop)."""
+        url = self.llm_base_url.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.llm_api_key:
+            headers["Authorization"] = f"Bearer {self.llm_api_key}"
+        model = self._resolve_llm_model_id()
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior engineer doing read-only repo analysis. "
+                        "Use only the context in the user message. "
+                        "Reply in plain markdown with sections "
+                        "## Findings, ## Proposed changes, and ## Implementation steps. "
+                        "Do not emit tool calls, XML, or shell commands."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": 4096,
+            "temperature": 0.2,
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=300)
+            resp.raise_for_status()
+            data = resp.json()
+            return (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+        except Exception as exc:
+            print(f"  [Planner] Local LLM failed: {exc}")
+            return ""
+
+    def _resolve_llm_model_id(self) -> str:
+        """Pick a model id that exists on the local OpenAI-compatible server."""
+        configured = self.llm_model
+        base = self.llm_base_url.rstrip("/")
+        headers = {}
+        if self.llm_api_key:
+            headers["Authorization"] = f"Bearer {self.llm_api_key}"
+        try:
+            resp = requests.get(f"{base}/models", headers=headers, timeout=5)
+            if resp.status_code != 200:
+                return configured
+            ids = [m["id"] for m in resp.json().get("data", [])]
+            if configured in ids:
+                return configured
+            bare = configured.split("/", 1)[-1]
+            if bare in ids:
+                return bare
+            for mid in ids:
+                if bare.lower() in mid.lower() or mid.lower() in configured.lower():
+                    return mid
+        except Exception:
+            pass
+        return configured
+
+    @staticmethod
+    def _format_task_for_prompt(issue: str, input_prompt: str = "") -> str:
+        from agent_graph.state import format_agent_task
+
+        return format_agent_task(issue, input_prompt)
+
+    def _build_planning_prompt(
+        self,
+        issue: str,
+        static_context: str,
+        workspace_dir: str,
+        *,
+        big_picture: str = "",
+        input_prompt: str = "",
     ) -> str:
+        task = self._format_task_for_prompt(issue, input_prompt)
+        overview_block = ""
+        if big_picture.strip():
+            overview_block = (
+                f"\n# Cross-repo context (read first)\n\n{big_picture}\n"
+            )
+        context_block = ""
+        if static_context.strip():
+            context_block = f"\n# Repository structure (static scan)\n\n{static_context}\n"
+        steps = [
+            f"Work in the repository at: {workspace_dir}",
+        ]
+        if (input_prompt or "").strip():
+            steps.append(
+                "Follow developer instructions when they narrow or expand scope "
+                "beyond the ticket"
+            )
+        steps.extend(
+            [
+                "Use `grep -r` / `find` first. Open at most 8 source files with the file editor",
+                "Skip tests, mocks, lockfiles, and build artifacts unless directly relevant",
+                "**Do not modify any source files.** Read-only analysis only",
+                "Identify which files would need changes and why",
+                "End with a structured report using exactly these sections",
+            ]
+        )
+        numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+        return (
+            f"# Task\n\nIssue: {task}\n"
+            f"{overview_block}"
+            f"{context_block}\n"
+            f"# Instructions (analysis only)\n\n"
+            f"{numbered}\n\n"
+            f"## Findings\n"
+            f"(root cause and relevant files)\n\n"
+            f"## Proposed changes\n"
+            f"(what to change and where)\n\n"
+            f"## Implementation steps\n"
+            f"(numbered steps for an engineer to implement)\n"
+        )
+
+    def _build_prompt(
+        self,
+        issue: str,
+        plan: str,
+        workspace_dir: str,
+        *,
+        input_prompt: str = "",
+    ) -> str:
+        task = self._format_task_for_prompt(issue, input_prompt)
         if workspace_dir != "/workspace":
             repo_instruction = f"Work in the repository at: {workspace_dir}"
         else:
@@ -154,18 +455,43 @@ class OpenHandsClient:
                 "No target repository was pre-provided. "
                 "If the task mentions a repository, clone it first before working on it."
             )
+        steps = [repo_instruction]
+        if (input_prompt or "").strip():
+            steps.append(
+                "Follow developer instructions when they narrow or expand scope "
+                "beyond the ticket"
+            )
+        from agent_graph.branch_naming import branch_creation_instruction
+
+        steps.extend(
+            [
+                branch_creation_instruction(task),
+                "Follow the plan above to implement the changes",
+                "Make all modifications inside the repository directory",
+                "When finished, run `git diff` and include the output in your final message",
+                "Provide a brief summary of what was changed",
+            ]
+        )
+        numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
         return (
-            f"# Task\n\nIssue: {issue}\n\n"
+            f"# Task\n\nIssue: {task}\n\n"
             f"# Implementation Plan\n\n{plan}\n\n"
             f"# Instructions\n\n"
-            f"1. {repo_instruction}\n"
-            f"2. Follow the plan above to implement the changes.\n"
-            f"3. Make all modifications inside the repository directory.\n"
-            f"4. When finished, run `git diff` and include the output in your final message.\n"
-            f"5. Provide a brief summary of what was changed.\n\n"
+            f"{numbered}\n\n"
             f"Confirm the repository exists, implement the changes, and show me "
             f"the `git diff` output."
         )
+
+    @staticmethod
+    def authenticated_git_url(repo_url: str) -> str:
+        """Backward-compatible alias for repo_clone.authenticated_clone_url."""
+        from agent_graph.repo_clone import authenticated_clone_url
+
+        return authenticated_clone_url(repo_url)
+
+    @staticmethod
+    def _authenticated_git_url(repo_url: str) -> str:
+        return OpenHandsClient.authenticated_git_url(repo_url)
 
     @staticmethod
     def _detect_platform() -> str:
@@ -188,21 +514,7 @@ class OpenHandsClient:
                 return base_url.replace(host, "host.docker.internal")
         return base_url
 
-    @staticmethod
-    def _authenticated_git_url(repo_url: str) -> str:
-        if not repo_url.startswith("https://github.com/"):
-            return repo_url
-        token = os.getenv("GITHUB_TOKEN", "")
-        if not token or "@" in repo_url:
-            return repo_url
-        return repo_url.replace(
-            "https://github.com/",
-            f"https://x-access-token:{token}@github.com/",
-            1,
-        )
-
     def _apply_container_llm_env(self) -> dict[str, str | None]:
-        """Set LLM_* env vars forwarded into the agent-server container."""
         previous = {key: os.environ.get(key) for key in LLM_ENV_KEYS}
         os.environ["LLM_MODEL"] = self.llm_model
         os.environ["LLM_API_KEY"] = self.llm_api_key or ""
@@ -279,28 +591,59 @@ class OpenHandsClient:
         workspace_dir: str,
         prompt: str,
         baseline_sha: str = "",
+        *,
+        mode: str = "execution",
+        skip_health_checks: bool = False,
+        check_changes: bool = True,
+        session: AgentServerSession | None = None,
     ) -> ExecutionResult:
-        print("\n[Executor / OpenHands]\nDocker check...")
-        if not self._check_docker_available():
-            return ExecutionResult(
-                success=False,
-                summary="Docker is not available. Start Docker Desktop and retry.",
-            )
+        label = "Planner / OpenHands" if mode == "planning" else "Executor / OpenHands"
 
-        print("\n[Executor / OpenHands]\nLLM health check...")
-        if not self._check_llm_health():
-            return ExecutionResult(
-                success=False,
-                summary="LLM endpoint not reachable. Start local endpoint first.",
-            )
+        if session is not None:
+            try:
+                if session._workspace is None:
+                    session.start()
+                return self._execute_on_workspace(
+                    session.workspace,
+                    repo_path=repo_path,
+                    workspace_dir=workspace_dir,
+                    prompt=prompt,
+                    baseline_sha=baseline_sha,
+                    mode=mode,
+                    label=label,
+                    check_changes=check_changes,
+                )
+            except ConversationRunError as e:
+                return ExecutionResult(
+                    success=False,
+                    summary=self._format_agent_error(e),
+                )
+            except Exception as e:
+                return ExecutionResult(
+                    success=False, summary=self._format_agent_error(e)
+                )
 
-        print("\n[Executor / OpenHands]\nSpawning agent-server container...")
+        if not skip_health_checks:
+            print(f"\n[{label}]\nDocker check...")
+            if not self._check_docker_available():
+                return ExecutionResult(
+                    success=False,
+                    summary="Docker is not available. Start Docker Desktop and retry.",
+                )
+
+            print(f"\n[{label}]\nLLM health check...")
+            if not self._check_llm_health():
+                return ExecutionResult(
+                    success=False,
+                    summary="LLM endpoint not reachable. Start local endpoint first.",
+                )
+
         volumes: list[str] = []
         if repo_path:
             volumes.append(f"{repo_path}:{workspace_dir}")
 
+        print(f"\n[{label}]\nSpawning agent-server container...")
         env_backup = self._apply_container_llm_env()
-        container_llm_url = self.llm_base_url_in_container
         try:
             with DockerWorkspace(
                 server_image=self.server_image,
@@ -310,53 +653,128 @@ class OpenHandsClient:
                 volumes=volumes,
             ) as workspace:
                 print(f"  Agent server: {workspace.host}")
-                print(f"  Workspace: {workspace.working_dir}")
-                print(f"  LLM (container): {container_llm_url}")
-
-                if not self._check_llm_health_in_container(workspace):
-                    return ExecutionResult(
-                        success=False,
-                        summary=(
-                            "LLM not reachable from agent-server container. "
-                            "Ensure Omlx is running and LLM_BASE_URL uses localhost "
-                            "(rewritten to host.docker.internal in container)."
-                        ),
-                    )
-
-                llm = LLM(
-                    model=self.llm_model,
-                    api_key=self.llm_api_key,
-                    base_url=container_llm_url,
-                    num_retries=3,
+                return self._execute_on_workspace(
+                    workspace,
+                    repo_path=repo_path,
+                    workspace_dir=workspace_dir,
+                    prompt=prompt,
+                    baseline_sha=baseline_sha,
+                    mode=mode,
+                    label=label,
+                    check_changes=check_changes,
+                    skip_container_health_check=skip_health_checks,
                 )
-                agent = Agent(
-                    llm=llm,
-                    tools=[
-                        Tool(name=TerminalTool.name),
-                        Tool(name=FileEditorTool.name),
-                    ],
-                )
-                print("  Agent tools: TerminalTool, FileEditorTool")
-                conversation = Conversation(
-                    agent=agent,
-                    workspace=workspace,
-                    max_iteration_per_run=500,
-                    stuck_detection=False,
-                )
-                try:
-                    print("  Sending prompt to agent...")
-                    conversation.send_message(prompt)
-                    conversation.run(blocking=True)
-                    print("  Agent completed")
-                finally:
-                    try:
-                        conversation.close()
-                    except Exception:
-                        pass
+        except ConversationRunError as e:
+            return ExecutionResult(
+                success=False,
+                summary=self._format_agent_error(e),
+            )
         except Exception as e:
-            return ExecutionResult(success=False, summary=f"Agent error: {e}")
+            return ExecutionResult(success=False, summary=self._format_agent_error(e))
         finally:
             self._restore_env(env_backup)
+
+    def _execute_on_workspace(
+        self,
+        workspace: DockerWorkspace,
+        *,
+        repo_path: str,
+        workspace_dir: str,
+        prompt: str,
+        baseline_sha: str = "",
+        mode: str,
+        label: str,
+        check_changes: bool = True,
+        skip_container_health_check: bool = False,
+    ) -> ExecutionResult:
+        max_iterations = (
+            self._planner_max_iterations()
+            if mode == "planning"
+            else self._executor_max_iterations()
+        )
+        container_llm_url = self.llm_base_url_in_container
+        print(f"  Workspace dir: {workspace_dir}")
+        print(f"  LLM (container): {container_llm_url}")
+        print(f"  Mode: {mode} (max_iterations={max_iterations})")
+
+        if not skip_container_health_check and not self._check_llm_health_in_container(
+            workspace
+        ):
+            return ExecutionResult(
+                success=False,
+                summary=(
+                    "LLM not reachable from agent-server container. "
+                    "Ensure Omlx is running and LLM_BASE_URL uses localhost "
+                    "(rewritten to host.docker.internal in container)."
+                ),
+            )
+
+        agent_summary = ""
+        try:
+            llm = LLM(
+                model=self.llm_model,
+                api_key=self.llm_api_key,
+                base_url=container_llm_url,
+                num_retries=3,
+            )
+            agent_tools = [
+                Tool(name=TerminalTool.name),
+                Tool(name=FileEditorTool.name),
+            ]
+            agent_kwargs: dict = {
+                "llm": llm,
+                "tools": agent_tools,
+            }
+            http_only = os.getenv("OPENHANDS_MCP_HTTP_ONLY", "1").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            mcp_config = build_openhands_mcp_config(http_only=http_only)
+            if mcp_config:
+                agent_kwargs["mcp_config"] = mcp_config
+                filter_regex = os.getenv("OPENHANDS_MCP_FILTER_REGEX", "")
+                if filter_regex:
+                    agent_kwargs["filter_tools_regex"] = filter_regex
+                servers = list(mcp_config.get("mcpServers", {}))
+                print(f"  Agent tools: TerminalTool, FileEditorTool + MCP {servers}")
+            else:
+                print("  Agent tools: TerminalTool, FileEditorTool")
+            agent = Agent(**agent_kwargs)
+            conversation = Conversation(
+                agent=agent,
+                workspace=workspace,
+                max_iteration_per_run=max_iterations,
+                stuck_detection=False,
+            )
+            try:
+                print("  Sending prompt to agent (new conversation)...")
+                conversation.send_message(prompt)
+                conversation.run(blocking=True)
+                print("  Agent completed")
+                agent_summary = self._extract_agent_summary(conversation)
+            finally:
+                try:
+                    conversation.close()
+                except Exception:
+                    pass
+        except ConversationRunError as e:
+            return ExecutionResult(
+                success=False,
+                summary=self._format_agent_error(e),
+            )
+        except Exception as e:
+            return ExecutionResult(success=False, summary=self._format_agent_error(e))
+
+        if mode == "planning":
+            summary = agent_summary or "Planning analysis completed"
+            print(f"  Done: {summary[:120]}...")
+            return ExecutionResult(
+                success=True,
+                summary=summary,
+                work_repo_path=repo_path,
+                repo_baseline_sha=baseline_sha,
+            )
 
         diff_patch = capture_diff_since(repo_path, baseline_sha) if repo_path else ""
         stat = diff_stat_since(repo_path, baseline_sha) if repo_path else ""
@@ -375,14 +793,20 @@ class OpenHandsClient:
                 for line in stat.splitlines()[:5]:
                     print(f"    {line}")
 
-        label = os.path.basename(repo_path) if repo_path else "workspace"
-        if repo_path and baseline_sha and not has_changes_since(repo_path, baseline_sha):
+        repo_label = os.path.basename(repo_path) if repo_path else "workspace"
+        if (
+            check_changes
+            and repo_path
+            and baseline_sha
+            and not has_changes_since(repo_path, baseline_sha)
+        ):
             summary = (
-                f"No file changes in {label} — OpenHands finished without editing the repo"
+                f"No file changes in {repo_label} — OpenHands finished without editing the repo"
             )
             print(f"  ⚠ {summary}")
             return ExecutionResult(
-                success=False,
+                success=True,
+                no_changes=True,
                 summary=summary,
                 work_repo_path=repo_path,
                 repo_baseline_sha=baseline_sha,
@@ -390,7 +814,7 @@ class OpenHandsClient:
                 change_stat=stat,
             )
 
-        summary = f"Task completed: {label}"
+        summary = agent_summary or f"Task completed: {repo_label}"
         print(f"  Done: {summary}")
         return ExecutionResult(
             success=True,
@@ -400,3 +824,41 @@ class OpenHandsClient:
             diff_patch=diff_patch,
             change_stat=stat,
         )
+
+    @staticmethod
+    def _format_agent_error(exc: Exception) -> str:
+        if isinstance(exc, ConversationRunError):
+            inner = exc.original_exception
+            msg = str(inner).strip() if inner else str(exc).strip()
+        else:
+            msg = str(exc).strip()
+        if not msg:
+            msg = "unknown agent failure"
+        if "Remote conversation ended with error" in msg:
+            return (
+                "Agent error: OpenHands conversation failed on the agent server "
+                "(no detailed error event). Check Docker logs for LLM or tool errors."
+            )
+        if "Prompt too long" in msg or "context window" in msg.lower():
+            return (
+                f"Agent error: LLM context limit exceeded — {msg}. "
+                "Try lowering PLANNER_STATIC_CONTEXT_MAX_CHARS or use a larger-context model."
+            )
+        if msg.startswith("Agent error:"):
+            return msg
+        return f"Agent error: {msg}"
+
+    @staticmethod
+    def _extract_agent_summary(conversation: Conversation) -> str:
+        try:
+            events = getattr(conversation, "events", None) or []
+            for event in reversed(list(events)):
+                role = getattr(event, "role", None) or getattr(event, "source", None)
+                content = getattr(event, "content", None) or getattr(event, "message", None)
+                if content and str(role).lower() in ("assistant", "agent"):
+                    text = content if isinstance(content, str) else str(content)
+                    if text.strip():
+                        return text.strip()
+        except Exception:
+            pass
+        return ""

@@ -4,6 +4,7 @@ import os
 import sys
 from typing import Any
 
+from agent_graph.pr_skip import NO_CHANGES_SKIP, is_no_changes_summary
 from agent_graph.state import TaskState
 
 
@@ -62,8 +63,27 @@ def format_final_result(state: TaskState) -> str:
             url = r.get("target_repo_path", "")
             pr = r.get("pr_url", "")
             err = r.get("pr_error", "")
-            status = f"  ✓ {pr}" if pr else f"  ✗ {err}" if err else ""
-            lines.append(f"  {url if not status else f'{url} {status}'}")
+            skip = r.get("pr_skip_reason", "")
+            deploy_tag = r.get("deploy_tag_name", "")
+            deploy_tag_err = r.get("deploy_tag_error", "")
+            if pr:
+                status = f"  ✓ {pr}"
+            elif err and not is_no_changes_summary(err):
+                status = f"  ✗ {err}"
+            elif skip == NO_CHANGES_SKIP or is_no_changes_summary(skip) or is_no_changes_summary(err):
+                status = "  ○ skipped (no changes)"
+            elif skip:
+                status = f"  ○ skipped: {skip}"
+            else:
+                status = ""
+            parts = [url]
+            if status:
+                parts.append(status.strip())
+            if deploy_tag:
+                parts.append(f"tag: {deploy_tag}")
+            if deploy_tag_err:
+                parts.append(f"tag error: {deploy_tag_err}")
+            lines.append("  " + " | ".join(parts))
 
     impl = state.get("implementation_result", "")
     if impl:
@@ -101,25 +121,31 @@ def format_final_result(state: TaskState) -> str:
         lines.append(_paint("✓ Pull request created", _C.BOLD, _C.GREEN))
         for url in pr_url.split("\n"):
             lines.append(f"  {url}")
-    elif pr_error:
+    if pr_error:
         lines.append(_paint("✗ PR creation failed", _C.BOLD, _C.RED))
         for err in pr_error.split("\n"):
             lines.append(f"  {err}")
-    elif skip:
-        lines.append(_paint("○ PR skipped", _C.BOLD, _C.YELLOW))
+    if skip:
+        lines.append(_paint("○ PR creation skipped", _C.BOLD, _C.YELLOW))
         for skip_line in skip.split("\n"):
             lines.append(f"  {skip_line}")
-        if "no changes" in skip.lower() and "commits_since_baseline=0" not in skip:
-            lines.append(
-                _paint(
-                    "  Tip: OpenHands may have stopped without editing files "
-                    "(check executor logs for tool availability).",
-                    _C.DIM,
-                )
-            )
-    else:
+    if not pr_url and not pr_error and not skip:
         lines.append(_paint("○ No pull request", _C.BOLD, _C.YELLOW))
         lines.append("  Workflow finished without opening a PR.")
+
+    deploy_tag_name = state.get("deploy_tag_name", "")
+    deploy_tag_error = state.get("deploy_tag_error", "")
+    deploy_env = state.get("deploy_env", "")
+    if deploy_env:
+        lines.append(_paint("Deploy env", _C.BOLD) + f"  {deploy_env}")
+    if deploy_tag_name:
+        lines.append(_paint("✓ Deploy tag pushed", _C.BOLD, _C.GREEN))
+        for tag_line in deploy_tag_name.split("\n"):
+            lines.append(f"  {tag_line}")
+    if deploy_tag_error:
+        lines.append(_paint("✗ Deploy tag failed", _C.BOLD, _C.RED))
+        for tag_err_line in deploy_tag_error.split("\n"):
+            lines.append(f"  {tag_err_line}")
 
     lines.append(sep)
     lines.append("")

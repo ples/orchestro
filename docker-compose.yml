@@ -7,6 +7,8 @@ services:
       - LLM_MODEL=openai/Qwen3.6-35B-A3B-UD-MLX-4bit
       - LLM_API_KEY=zaqw
       - LLM_BASE_URL=http://host.docker.internal:8555/v1
+      # Keep exception tracebacks as compact \n-separated strings (not pretty-printed)
+      - LOGGING_FORMATTER=compact
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ~/.openhands:/.openhands

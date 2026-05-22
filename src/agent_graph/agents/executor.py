@@ -27,6 +27,7 @@ class ExecutorAgent(BaseAgent):
             target_repo=target_repo,
             issue=state["issue"],
             plan=state["plan"],
+            input_prompt=state.get("input_prompt", ""),
         )
 
         if not result.success:

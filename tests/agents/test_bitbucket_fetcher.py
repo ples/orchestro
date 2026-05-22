@@ -48,7 +48,7 @@ class TestParseRepoRemote:
 
     def test_from_git_ssh_url(self):
         owner, repo = BitbucketFetcher.parse_repo_remote(
-            "git@bitbucket.com:acme/myapp.git",
+            "git@bitbucket.org:acme/myapp.git",
         )
         assert owner == "acme"
         assert repo == "myapp"
@@ -103,6 +103,9 @@ class TestGetDefaultBranch:
             branch = fetcher.get_default_branch("acme", "myapp")
             assert branch == "main"
             assert mock_get.call_args[1]["params"] == {"sort": "target.date"}
+            assert mock_get.call_args[0][0] == (
+                "https://api.bitbucket.org/2.0/repositories/acme/myapp/refs/branches"
+            )
 
     def test_get_default_branch_first_fallback(self):
         fetcher = BitbucketFetcher(token="fake")
@@ -174,7 +177,7 @@ class TestFetchIssues:
             assert issues[0].title == "Jira linked task"
             assert issues[0].priority == "High"
 
-    def test_fetch_issues_auth_header(self):
+    def test_fetch_issues_bearer_when_explicit_token_only(self):
         fetcher = BitbucketFetcher(token="my-secret-token")
         mock_response = MagicMock()
         mock_response.status_code = 200
@@ -183,6 +186,21 @@ class TestFetchIssues:
             fetcher.fetch_issues("acme", "myapp")
             headers = mock_get.call_args[1]["headers"]
             assert headers["Authorization"] == "Bearer my-secret-token"
+            assert "auth" not in mock_get.call_args[1]
+
+    def test_fetch_issues_basic_auth_with_email(self, monkeypatch):
+        monkeypatch.setenv("BITBUCKET_TOKEN", "bb-tok")
+        monkeypatch.delenv("BB_USERNAME", raising=False)
+        monkeypatch.delenv("ATLASSIAN_EMAIL", raising=False)
+        monkeypatch.setenv("JIRA_EMAIL", "user@example.com")
+        fetcher = BitbucketFetcher()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"values": []}
+        with patch.object(requests, "get", return_value=mock_response) as mock_get:
+            fetcher.fetch_issues("acme", "myapp")
+            assert mock_get.call_args[1]["auth"] == ("user@example.com", "bb-tok")
+            assert "Authorization" not in mock_get.call_args[1]["headers"]
 
 
 class TestCreatePullRequest:
@@ -196,6 +214,9 @@ class TestCreatePullRequest:
         with patch.object(requests, "post", return_value=mock_response) as mock_post:
             url = fetcher.create_pull_request("acme", "myapp", "Add feature", "feature", "main", "Body")
             assert url == "https://bitbucket.org/acme/myapp/pull-requests/1"
+            assert mock_post.call_args[0][0] == (
+                "https://api.bitbucket.org/2.0/repositories/acme/myapp/pullrequests"
+            )
 
     def test_create_pull_request_api_error(self):
         fetcher = BitbucketFetcher(token="fake")

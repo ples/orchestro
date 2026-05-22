@@ -70,6 +70,23 @@ class GitHubFetcher:
             raise RuntimeError(f"GitHub API error {resp.status_code}: {resp.text}")
         return resp.json()["default_branch"]
 
+    def find_pull_request_for_head(
+        self, owner: str, repo: str, head: str, *, state: str = "open"
+    ) -> str | None:
+        url = f"{self.REPO_API.format(owner=owner, repo=repo)}/pulls"
+        resp = requests.get(
+            url,
+            headers=self._headers(),
+            params={"head": f"{owner}:{head}", "state": state, "per_page": 5},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return None
+        pulls = resp.json()
+        if pulls:
+            return pulls[0]["html_url"]
+        return None
+
     def create_pull_request(
         self,
         owner: str,
@@ -79,6 +96,10 @@ class GitHubFetcher:
         base: str,
         body: str,
     ) -> str:
+        existing = self.find_pull_request_for_head(owner, repo, head)
+        if existing:
+            return existing
+
         url = f"{self.REPO_API.format(owner=owner, repo=repo)}/pulls"
         resp = requests.post(
             url,
@@ -86,6 +107,10 @@ class GitHubFetcher:
             json={"title": title, "head": head, "base": base, "body": body},
             timeout=30,
         )
+        if resp.status_code == 422:
+            existing = self.find_pull_request_for_head(owner, repo, head, state="all")
+            if existing:
+                return existing
         if resp.status_code not in (200, 201):
             raise RuntimeError(f"GitHub API error {resp.status_code}: {resp.text}")
         return resp.json()["html_url"]

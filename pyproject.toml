@@ -21,6 +21,8 @@ dependencies = [
     "openhands-sdk==1.21.1",
     "openhands-tools==1.21.1",
     "openhands-workspace==1.21.1",
+    "langchain-mcp-adapters>=0.1.0",
+    "mcp>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +31,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.4.0",
     "mypy>=1.10",
+    "fastmcp>=2.0",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -4,8 +4,6 @@ import contextlib
 import os
 import re
 import subprocess
-from datetime import datetime
-
 from agent_graph.agents.bitbucket_fetcher import BitbucketFetcher
 from agent_graph.agents.github_fetcher import GitHubFetcher
 from agent_graph.exceptions import PrCreationError
@@ -66,12 +64,10 @@ class PrCreatorAgent(BaseAgent):
         except ValueError as e:
             raise PrCreationError(str(e)) from e
 
+        from agent_graph.branch_naming import resolve_work_branch
+
         issue_number = self._issue_number(github_issue_url)
-        branch = (
-            f"agent/issue-{issue_number}"
-            if issue_number
-            else f"agent/run-{datetime.now(datetime.UTC).strftime('%Y%m%d%H%M%S')}"
-        )
+        branch = resolve_work_branch(work_repo_path, state.get("issue", ""))
 
         auth_remote = (
             f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
@@ -84,7 +80,7 @@ class PrCreatorAgent(BaseAgent):
             self._git(work_repo_path, "remote", "set-url", "origin", auth_remote)
             self._git(work_repo_path, "config", "user.name", git_name)
             self._git(work_repo_path, "config", "user.email", git_email)
-            self._git(work_repo_path, "checkout", "-b", branch)
+            self._checkout_branch(work_repo_path, branch)
             if has_uncommitted_changes(work_repo_path):
                 self._git(work_repo_path, "add", "-A")
                 self._git(work_repo_path, "commit", "-m", commit_msg)
@@ -211,12 +207,10 @@ class PrCreatorAgent(BaseAgent):
         except ValueError as e:
             return {"pr_url": "", "pr_error": str(e), "pr_skip_reason": ""}
 
+        from agent_graph.branch_naming import resolve_work_branch
+
         issue_number = self._issue_number(github_issue_url)
-        branch = (
-            f"agent/issue-{issue_number}"
-            if issue_number
-            else f"agent/run-{datetime.now(datetime.UTC).strftime('%Y%m%d%H%M%S')}"
-        )
+        branch = resolve_work_branch(work_repo_path, state.get("issue", ""))
 
         auth_remote = (
             f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
@@ -229,7 +223,7 @@ class PrCreatorAgent(BaseAgent):
             self._git(work_repo_path, "remote", "set-url", "origin", auth_remote)
             self._git(work_repo_path, "config", "user.name", git_name)
             self._git(work_repo_path, "config", "user.email", git_email)
-            self._git(work_repo_path, "checkout", "-b", branch)
+            self._checkout_branch(work_repo_path, branch)
             if has_uncommitted_changes(work_repo_path):
                 self._git(work_repo_path, "add", "-A")
                 self._git(work_repo_path, "commit", "-m", commit_msg)
@@ -271,15 +265,15 @@ class PrCreatorAgent(BaseAgent):
         except ValueError as e:
             return {"pr_url": "", "pr_error": str(e), "pr_skip_reason": ""}
 
+        from agent_graph.branch_naming import resolve_work_branch
+
         identifier = self._issue_identifier(state, "bitbucket")
-        branch = (
-            f"agent/issue-{identifier}"
-            if identifier
-            else f"agent/run-{datetime.now(datetime.UTC).strftime('%Y%m%d%H%M%S')}"
-        )
+        branch = resolve_work_branch(work_repo_path, state.get("issue", ""))
+
+        from agent_graph.repo_clone import BITBUCKET_GIT_USERNAME
 
         auth_remote = (
-            f"https://x-token-auth:{token}@bitbucket.org/{owner}/{repo}.git"
+            f"https://{BITBUCKET_GIT_USERNAME}:{token}@bitbucket.org/{owner}/{repo}.git"
         )
         git_name = os.getenv("GIT_AUTHOR_NAME", "Agent Graph")
         git_email = os.getenv("GIT_AUTHOR_EMAIL", "agent@users.noreply.github.com")
@@ -289,7 +283,7 @@ class PrCreatorAgent(BaseAgent):
             self._git(work_repo_path, "remote", "set-url", "origin", auth_remote)
             self._git(work_repo_path, "config", "user.name", git_name)
             self._git(work_repo_path, "config", "user.email", git_email)
-            self._git(work_repo_path, "checkout", "-b", branch)
+            self._checkout_branch(work_repo_path, branch)
             if has_uncommitted_changes(work_repo_path):
                 self._git(work_repo_path, "add", "-A")
                 self._git(work_repo_path, "commit", "-m", commit_msg)
@@ -331,6 +325,16 @@ class PrCreatorAgent(BaseAgent):
     def _pr_body_brief(self, state: TaskState) -> str:
         issue_line = state.get("issue", "").strip().split("\n")[0][:100]
         return issue_line or "Agent implementation"
+
+    def _checkout_branch(self, repo_path: str, branch: str) -> None:
+        exists = subprocess.run(
+            ["git", "-C", repo_path, "rev-parse", "--verify", branch],
+            capture_output=True,
+        )
+        if exists.returncode == 0:
+            self._git(repo_path, "checkout", branch)
+        else:
+            self._git(repo_path, "checkout", "-b", branch)
 
     @staticmethod
     def _git(repo_path: str, *args: str) -> None:

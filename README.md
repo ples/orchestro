@@ -70,6 +70,26 @@ Custom task:
 python -m agent_graph.main --issue "Add OAuth2 login flow"
 ```
 
+Jira ticket with extra developer context (scope beyond the ticket body):
+
+```bash
+python -m agent_graph.main \
+  --issue "https://company.atlassian.net/browse/MINSKY-123" \
+  --repo "https://bitbucket.org/team/admin-ui.git,https://bitbucket.org/team/api.git" \
+  --prompt "Fix email verified flag in both frontend and backend; backend is source of truth."
+```
+
+Deploy environment git tag (after branch push, before/at PR creation):
+
+```bash
+python -m agent_graph.main \
+  --issue "https://company.atlassian.net/browse/MINSKY-123" \
+  --repo "https://bitbucket.org/team/api.git" \
+  --deploy-env dev
+```
+
+The tag format is `env.{env}.branch.{branch}` (e.g. `env.dev.branch.hotfix/my-fix`). The tag is created at the commit HEAD and pushed in the same `git push` as the branch so CI/CD sees it when the branch webhook fires. You can also set `DEPLOY_ENV` in `.env` or infer the environment from `--prompt` / issue text (e.g. `deploy to stage`).
+
 #### 4. Install dev dependencies and run tests
 
 ```bash
@@ -89,6 +109,7 @@ graph = build_graph()
 # Define initial state
 state: TaskState = {
     "issue": "Add logout endpoint",
+    "input_prompt": "",
     "plan": "",
     "implementation_result": "",
     "verification_result": "",
@@ -120,15 +141,21 @@ result = graph.invoke(state)
 
 ## Graph Topology
 
-The workflow is a directed state machine that ends after PR creation (or skip when there are no changes):
+The workflow is a directed state machine that ends after PR creation (or skip when there are no changes).
+For Jira/Bitbucket issues, `repo_resolver` runs first to detect target repositories from the issue text.
 
 ```mermaid
 flowchart LR
-    P["<b>planner</b><br/>Generate plan"] --> E["<b>executor</b><br/>Execute"]
-    E --> V["<b>verifier</b><br/>Verify"]
-    V --> PR["<b>pr_creator</b><br/>Open PR"]
-    PR --> DONE["<b>end</b>"]
+    RR["repo_resolver"] --> P["planner"]
+    P --> E["executor_loop"]
+    E --> V["verifier"]
+    V --> PR["pr_aggregator"]
+    PR --> DONE["end"]
 ```
+
+**Planner phase:** clones each detected repo, runs a static dependency scan, then OpenHands in Docker (read-only analysis) to produce per-repo `repo_summary` and an aggregated `plan`.
+
+**Executor phase:** reuses planner clones (`planner_clone_path`), resets git to baseline, then OpenHands implements the plan per repository.
 
 ## Data Model
 
@@ -148,12 +175,15 @@ classDiagram
 ```
 
 - `issue` — original task description.
-- `plan` — structured plan produced by the planner, ingested by the executor.
+- `plan` — aggregated implementation plan from the planner (includes per-repo OpenHands analysis).
+- `target_repos` — list of `RepoRecord` entries (`target_repo_path`, `planner_clone_path`, `repo_summary`, `work_repo_path`, …).
 - `implementation_result` — summary of code changes from the executor.
 - `verification_result` — test/lint/static-analysis output from the verifier.
-- `work_repo_path` — host path to the temp clone with OpenHands edits (used by PR creator).
+- `work_repo_path` — host path to the clone with OpenHands edits (used by PR creator).
 - `pr_url` — URL of the created pull request (empty if skipped or failed).
 - `pr_error` — error message when PR creation failed.
+
+Optional env: `GIT_CLONE_TIMEOUT` (default 120s), `PLANNER_MAX_ITERATIONS` (default 80), `EXECUTOR_MAX_ITERATIONS` (default 500).
 
 Pydantic models keep structured payloads typed and validated:
 
@@ -240,6 +270,36 @@ classDiagram
     AgentError <|-- VerifierError
     AgentError <|-- PrCreationError
 ```
+
+## MCP Integration
+
+The agent graph can use [Model Context Protocol](https://modelcontextprotocol.io/) servers for documentation lookup, Jira ingest, and (optionally) OpenHands executor tools.
+
+### Configuration
+
+- Project config: [`mcp.config.json`](mcp.config.json) — enable servers and set `transport` (`stdio` or `http`)
+- Secrets: `.env` only (e.g. `CONTEXT7_API_KEY`, `JIRA_CLOUD_ID`)
+- Optional merge from Cursor: `MCP_USE_CURSOR_CONFIG=1` reads `~/.cursor/mcp.json` (project entries override)
+
+### Host-side MCP (planner)
+
+When the issue mentions libraries (FastAPI, LangGraph, React, etc.), the planner calls **Context7** via local stdio (`npx -y @upstash/context7-mcp`) and appends docs to `repo_context`.
+
+Disable with `MCP_CONTEXT7_ENABLED=0`.
+
+Requires `npx` on the host (same as Cursor).
+
+### Jira via MCP (optional)
+
+```bash
+python -m agent_graph.main --jira --jira-mcp --jira-project PROJ
+```
+
+Or set `JIRA_USE_MCP=1` and enable the `atlassian` server in `mcp.config.json`. REST fetcher remains the default.
+
+### Executor MCP (OpenHands)
+
+Set `OPENHANDS_MCP_ENABLED=1` to pass MCP servers into the OpenHands `Agent` inside Docker. By default only **HTTP** servers are included (`OPENHANDS_MCP_HTTP_ONLY=1`) because stdio/`npx` may be unavailable in the agent-server image.
 
 ## Tech Stack
 

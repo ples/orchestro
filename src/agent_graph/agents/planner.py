@@ -1,12 +1,17 @@
 import os
 import re
 import subprocess
-import tempfile
 from pathlib import Path
 
-from agent_graph.openhands_client import OpenHandsClient
 from agent_graph.agents.repo_detector import RepoDetectorAgent
-from agent_graph.state import TaskState
+from agent_graph.exceptions import ExecutorError
+from agent_graph.openhands_client import (
+    AgentServerSession,
+    OpenHandsClient,
+    reuse_agent_server,
+)
+from agent_graph.repo_clone import clone_planner_workspace
+from agent_graph.state import RepoRecord, TaskState, format_agent_task
 
 from .base import BaseAgent
 
@@ -15,6 +20,7 @@ SOURCE_EXTENSIONS = {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs",
 
 # Common entry-point file / module names
 ENTRY_POINT_NAMES = {"main", "app", "index", "__main__"}
+DEFAULT_STATIC_CONTEXT_MAX_CHARS = 8000
 
 
 class PlannerAgent(BaseAgent):
@@ -24,80 +30,225 @@ class PlannerAgent(BaseAgent):
 
     def _execute(self, state: TaskState) -> dict:
         issue = state["issue"]
+        input_prompt = state.get("input_prompt", "")
+        agent_task = format_agent_task(issue, input_prompt)
         print("\n[Planner]")
         print(f"Analyzing issue: {issue}")
+        if input_prompt.strip():
+            preview = input_prompt.strip()[:120]
+            suffix = "..." if len(input_prompt.strip()) > 120 else ""
+            print(f"  Developer instructions: {preview}{suffix}")
+
+        mcp_context = state.get("mcp_context", "")
+        mcp_tools_used: list[str] = list(state.get("mcp_tools_used", []))
+        if not mcp_context:
+            mcp_context, tools = self._fetch_mcp_context(agent_task)
+            mcp_tools_used.extend(tools)
 
         github_url = state.get("github_issue_url", "")
-        repo_info = ""
+        repo_info = self._parse_repo_url(github_url) if github_url else ""
 
-        if github_url:
-            repo_info = self._parse_repo_url(github_url)
-
-        repo_context = self._fetch_repo_context(state)
-        target_repos = state.get("target_repos", [])
-
-        # Detect deps if GITHUB_TOKEN present, otherwise continue
+        target_repos: list[RepoRecord] = list(state.get("target_repos", []))
         if target_repos:
             for r in target_repos:
-                url = r.get("target_repo_path", "")
-                print(f"  [Planner] Target repo: {url}")
+                print(f"  [Planner] Target repo: {r.get('target_repo_path', '')}")
 
         if not target_repos:
             det = RepoDetectorAgent()
             target_repos = det.run(state).get("target_repos", [])
 
+        for r in target_repos:
+            print(f"  [Planner] Detected repo: {r.get('target_repo_path', '')}")
+
+        repo_context_parts: list[str] = []
+        if mcp_context:
+            repo_context_parts.append(mcp_context)
+
         if target_repos:
-            for r in target_repos:
-                url = r.get("target_repo_path", "")
-                print(f"  [Planner] Detected repo: {url}")
-            repo_context = self._update_repo_context(repo_context, target_repos)
+            target_repos = self._analyze_target_repos(
+                issue, input_prompt, target_repos, repo_context_parts
+            )
+        else:
+            print("  [Planner] No target repositories — building plan from issue text only")
+            repo_context_parts.append(
+                "(No repositories detected — planner working without repo context)"
+            )
 
-        plan = self._build_plan(issue, repo_info, repo_context, target_repos)
-
-        return {"plan": plan, "repo_context": repo_context, "target_repos": target_repos}
-
-    def _fetch_repo_context(self, state: TaskState) -> str:
-        """Clone (if needed) and analyse the repository structure + dependencies."""
-        target = state.get("target_repo_path", "") or ""
-
-        if not target or not target.strip():
-            print("  [Repo] No target repo provided — skipping")
-            return "(No repository provided — planner working without repo context)"
-
-        # Decide whether to clone or use local path
-        is_remote = (
-            target.startswith("http://")
-            or target.startswith("https://")
-            or target.startswith("git@")
+        repo_context = "\n\n".join(repo_context_parts)
+        plan = self._build_plan(
+            issue, repo_info, repo_context, target_repos, input_prompt=input_prompt
         )
 
-        if is_remote:
-            temp_dir = tempfile.mkdtemp(prefix="planner_repo_")
-            repo_name = target.rstrip("/").split("/")[-1].replace(".git", "")
-            clone_path = os.path.join(temp_dir, repo_name)
-            print(f"  [Repo] Cloning {repo_name} to {temp_dir}")
+        return {
+            "plan": plan,
+            "repo_context": repo_context,
+            "target_repos": target_repos,
+            "mcp_context": mcp_context,
+            "mcp_tools_used": mcp_tools_used,
+            "workflow_node": "planning",
+        }
+
+    def _analyze_target_repos(
+        self,
+        issue: str,
+        input_prompt: str,
+        target_repos: list[RepoRecord],
+        repo_context_parts: list[str],
+    ) -> list[RepoRecord]:
+        agent_task = format_agent_task(issue, input_prompt)
+        client = OpenHandsClient()
+        runtime_err = client.check_runtime_ready()
+        skip_checks = runtime_err is None
+
+        urls = [
+            r.get("target_repo_path", "")
+            for r in target_repos
+            if r.get("target_repo_path", "")
+        ]
+
+        updated: list[RepoRecord] = []
+        if not urls:
+            return list(target_repos)
+
+        print(f"\n  [Planner] Phase 1: cloning {len(urls)} repositories...")
+        try:
+            _parent, clones = clone_planner_workspace(urls)
+        except ExecutorError as exc:
+            for repo_record in target_repos:
+                url = repo_record.get("target_repo_path", "")
+                record: RepoRecord = dict(repo_record)
+                if url:
+                    record["repo_summary"] = f"Clone failed: {exc}"
+                updated.append(record)
+            return updated
+
+        prepared: list[tuple[RepoRecord, str, str, str]] = []
+        for repo_record in target_repos:
+            url = repo_record.get("target_repo_path", "")
+            if not url:
+                updated.append(repo_record)
+                continue
+            record = dict(repo_record)
+            if url not in clones:
+                record["repo_summary"] = "Clone failed: repository not in workspace"
+                updated.append(record)
+                continue
+            clone_path, baseline = clones[url]
+            record["planner_clone_path"] = clone_path
+            record["repo_baseline_sha"] = baseline
+            prepared.append((record, url, clone_path, baseline))
+
+        if not prepared:
+            return updated
+
+        print(f"\n  [Planner] Phase 2: scanning {len(prepared)} repositories...")
+        repo_scans: dict[str, str] = {}
+        for record, url, clone_path, _baseline in prepared:
+            static_context = self._analyse_repo(clone_path)
+            grep_hints = self._collect_grep_hints(clone_path, agent_task)
+            if grep_hints:
+                static_context = f"{static_context}\n\n{grep_hints}"
+            repo_scans[url] = static_context
+            repo_context_parts.append(f"### Static scan: {url}\n{static_context}")
+
+        combined_context = self._build_combined_repo_context(prepared, repo_scans)
+        print("\n  [Planner] Phase 3: cross-repo analysis (big picture)...")
+        big_picture = client.run_cross_repo_planning(
+            issue, combined_context, input_prompt=input_prompt
+        )
+        if big_picture:
+            repo_context_parts.insert(0, f"### Cross-repo overview\n{big_picture}")
+
+        use_openhands = os.getenv("PLANNER_USE_OPENHANDS", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        session: AgentServerSession | None = None
+        if (
+            use_openhands
+            and reuse_agent_server()
+            and not runtime_err
+            and len(prepared) > 0
+        ):
+            mounts = [
+                (clone_path, os.path.basename(clone_path))
+                for _record, _url, clone_path, _base in prepared
+            ]
+            session = AgentServerSession(client, mounts, skip_health_checks=skip_checks)
             try:
-                clone_url = OpenHandsClient._authenticated_git_url(target)
-                subprocess.run(
-                    ["git", "clone", "--depth", "1", clone_url, clone_path],
-                    check=True,
-                    capture_output=True,
-                    timeout=120,
+                session.start()
+            except Exception as exc:
+                print(f"  [Planner] Shared agent server failed: {exc}")
+                session = None
+
+        print(f"\n  [Planner] Phase 4: per-repository analysis ({len(prepared)} repos)...")
+        try:
+            for i, (record, url, clone_path, baseline) in enumerate(prepared):
+                print(f"\n  [Planner] Repo {i + 1}/{len(prepared)}: {url}")
+
+                if runtime_err:
+                    record["repo_summary"] = f"Planning skipped: {runtime_err}"
+                    updated.append(record)
+                    continue
+
+                result = client.run_planning_task(
+                    target_repo=url,
+                    issue=issue,
+                    static_context=repo_scans[url],
+                    existing_repo_path=clone_path,
+                    baseline_sha=baseline,
+                    skip_health_checks=skip_checks,
+                    big_picture=big_picture,
+                    input_prompt=input_prompt,
+                    session=session,
                 )
-                print(f"  [Repo] Cloned into {clone_path}")
-                return self._analyse_repo(clone_path)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                msg = f"Failed to clone repo: {exc}"
-                print(f"  [Repo] {msg}")
-                return f"(Failed to clone repo: {exc})"
-        else:
-            p = Path(target)
-            if not p.is_dir():
-                msg = f"Target repo does not exist: {target}"
-                print(f"  [Repo] {msg}")
-                return f"(Target repo does not exist: {target})"
-            print(f"  [Repo] Using local repo at {target}")
-            return self._analyse_repo(str(p))
+
+                if result.success:
+                    record["repo_summary"] = result.summary
+                    print(f"  [Planner] Analysis complete for {url}")
+                else:
+                    record["repo_summary"] = (
+                        result.summary or "Planning analysis failed"
+                    )
+                    print(
+                        f"  [Planner] Analysis failed for {url}: "
+                        f"{record['repo_summary'][:120]}"
+                    )
+
+                if result.planner_clone_path:
+                    record["planner_clone_path"] = result.planner_clone_path
+                if result.repo_baseline_sha:
+                    record["repo_baseline_sha"] = result.repo_baseline_sha
+
+                updated.append(record)
+        finally:
+            if session is not None:
+                session.stop()
+
+        return updated
+
+    @staticmethod
+    def _build_combined_repo_context(
+        prepared: list[tuple[RepoRecord, str, str, str]],
+        repo_scans: dict[str, str],
+    ) -> str:
+        parts = []
+        for _record, url, clone_path, _baseline in prepared:
+            name = os.path.basename(clone_path)
+            scan = repo_scans.get(url, "")
+            parts.append(f"## {name}\n- URL: {url}\n- Path: /workspace/{name}\n\n{scan}")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _fetch_mcp_context(issue: str) -> tuple[str, list[str]]:
+        try:
+            from agent_graph.mcp.context7 import enrich_with_context7_sync
+
+            return enrich_with_context7_sync(issue)
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            print(f"  [MCP] Context7 skipped: {exc}")
+            return "", []
 
     def _analyse_repo(self, repo_dir: str) -> str:
         """Walk the repo and produce a dependency-graph string."""
@@ -180,35 +331,148 @@ class PlannerAgent(BaseAgent):
 
         print(f"  [Repo] Max dependency depth: {max_depth}")
 
-        # 5. Format output
-        lines = []
-        lines.append("=== Repository Context ===")
-        lines.append("")
-        lines.append("File tree (source files):")
-        tree_files = sorted(dep_map.keys())
-        for tf in tree_files:
-            parts = Path(tf).parts
-            indent = "  " * (len(parts) - 1)
-            lines.append(f"{indent}{parts[-1]}")
+        lines = self._format_repo_context(
+            repo_path,
+            source_files,
+            ext_counts,
+            dep_map,
+            entry_points,
+            depth_map,
+            total_imports_found,
+        )
+        return self._truncate_static_context("\n".join(lines))
 
-        if entry_points:
+    @staticmethod
+    def _static_context_max_chars() -> int:
+        raw = os.getenv("PLANNER_STATIC_CONTEXT_MAX_CHARS", "").strip()
+        if raw.isdigit():
+            return int(raw)
+        return DEFAULT_STATIC_CONTEXT_MAX_CHARS
+
+    @staticmethod
+    def _truncate_static_context(text: str) -> str:
+        limit = PlannerAgent._static_context_max_chars()
+        if len(text) <= limit:
+            return text
+        suffix = "\n\n[... static context truncated for LLM context limit ...]"
+        keep = max(0, limit - len(suffix))
+        return text[:keep] + suffix
+
+    def _format_repo_context(
+        self,
+        repo_path: Path,
+        source_files: list[str],
+        ext_counts: dict[str, int],
+        dep_map: dict[str, list[str]],
+        entry_points: list[str],
+        depth_map: dict[str, int],
+        total_imports_found: int,
+    ) -> list[str]:
+        lines = ["=== Repository Context ===", ""]
+        ext_summary = ", ".join(f"{v}{k}" for k, v in sorted(ext_counts.items()))
+        lines.append(
+            f"Summary: {len(source_files)} source files ({ext_summary}), "
+            f"{total_imports_found} resolved local imports"
+        )
+
+        compact = total_imports_found == 0 and len(source_files) > 40
+        if compact:
+            lines.append("")
+            lines.append(self._summarize_file_tree(repo_path, source_files))
+            lines.append(
+                "\nHint: start with targeted grep for issue keywords "
+                "(email, verified, verification, status) before opening files."
+            )
+        else:
+            lines.append("")
+            lines.append("File tree (source files):")
+            for tf in sorted(dep_map.keys())[:120]:
+                parts = Path(tf).parts
+                indent = "  " * (len(parts) - 1)
+                lines.append(f"{indent}{parts[-1]}")
+            if len(dep_map) > 120:
+                lines.append(f"  ... and {len(dep_map) - 120} more files")
+
+        if entry_points and not compact:
             lines.append("\nEntry points (no internal dependencies):")
-            for ep in entry_points:
-                rel_stem = str(Path(ep).with_suffix(""))
-                lines.append(f"  - {rel_stem}")
+            for ep in entry_points[:30]:
+                lines.append(f"  - {Path(ep).with_suffix('')}")
+            if len(entry_points) > 30:
+                lines.append(f"  ... and {len(entry_points) - 30} more")
 
-        if depth_map:
+        if depth_map and total_imports_found > 0:
             mx_d = max(depth_map.values())
             for d in range(mx_d + 1):
                 mods = sorted(f for f, dep in depth_map.items() if dep == d)
-                if mods:
-                    lines.append(f"\nLayer {d} (depth {d}):")
-                    for m in mods:
-                        imp_str = ", ".join(dep_map[m]) if dep_map[m] else "(standalone)"
-                        lines.append(f"  - {m} => [{imp_str}]")
+                if not mods:
+                    continue
+                lines.append(f"\nLayer {d} (depth {d}):")
+                for m in mods[:40]:
+                    imp_str = ", ".join(dep_map[m]) if dep_map[m] else "(standalone)"
+                    lines.append(f"  - {m} => [{imp_str}]")
+                if len(mods) > 40:
+                    lines.append(f"  ... and {len(mods) - 40} more")
 
-        lines.append("")
-        lines.append("=== End Repository Context ===")
+        lines.extend(["", "=== End Repository Context ==="])
+        return lines
+
+    def _collect_grep_hints(self, repo_dir: str, issue: str) -> str:
+        keywords = [
+            "email",
+            "verified",
+            "verification",
+            "Unknown",
+            "status",
+        ]
+        for word in re.findall(r"[A-Za-z]{5,}", issue):
+            if word.lower() not in {k.lower() for k in keywords}:
+                keywords.append(word)
+        keywords = list(dict.fromkeys(keywords))[:10]
+
+        patterns: list[str] = []
+        for kw in keywords:
+            try:
+                result = subprocess.run(
+                    [
+                        "grep",
+                        "-rni",
+                        "--include=*.java",
+                        "--include=*.ts",
+                        "--include=*.tsx",
+                        "--include=*.js",
+                        "-m",
+                        "2",
+                        kw,
+                        repo_dir,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+            if result.stdout.strip():
+                patterns.append(f"### grep '{kw}'\n```\n{result.stdout.strip()[:2000]}\n```")
+
+        if not patterns:
+            return ""
+        body = "\n\n".join(patterns[:6])
+        if len(patterns) > 6:
+            body += f"\n\n(... {len(patterns) - 6} more keyword searches omitted)"
+        return f"=== Targeted grep hints ===\n\n{body}\n\n=== End grep hints ==="
+
+    @staticmethod
+    def _summarize_file_tree(repo_path: Path, source_files: list[str]) -> str:
+        by_top: dict[str, int] = {}
+        for fpath in source_files:
+            rel = os.path.relpath(fpath, repo_path)
+            top = rel.split(os.sep)[0] if os.sep in rel else rel
+            by_top[top] = by_top.get(top, 0) + 1
+        lines = ["File tree summary (dependency scan skipped large listing):"]
+        for top, count in sorted(by_top.items(), key=lambda x: (-x[1], x[0]))[:25]:
+            lines.append(f"  - {top}/ ({count} files)")
+        if len(by_top) > 25:
+            lines.append(f"  ... and {len(by_top) - 25} more top-level paths")
         return "\n".join(lines)
 
     def _extract_imports(self, filepath: str, repo_path: Path) -> list[str]:
@@ -301,29 +565,49 @@ class PlannerAgent(BaseAgent):
                 return f"{match.group(1)}/{match.group(2)}"
         return ""
 
-    def _build_plan(self, issue: str, repo_info: str, repo_context: str, target_repos: list | None = None) -> str:
-        """Generate implementation plan with repo context."""
-        lines = []
-        lines.append("=== PLAN ===")
-        lines.append("")
-        lines.append(repo_context)
-        lines.append("")
-        lines.append("Implementation steps:")
+    def _build_plan(
+        self,
+        issue: str,
+        repo_info: str,
+        repo_context: str,
+        target_repos: list[RepoRecord] | None = None,
+        *,
+        input_prompt: str = "",
+    ) -> str:
+        """Generate aggregated implementation plan from per-repo analysis."""
+        lines = ["=== PLAN ===", ""]
+        if (input_prompt or "").strip():
+            lines.append("## Developer instructions")
+            lines.append(input_prompt.strip())
+            lines.append("")
+
+        if repo_context.strip():
+            lines.append(repo_context)
+            lines.append("")
 
         if target_repos:
-            lines.append("")
-            repos_str = "\n".join(f"  {r}" for r in target_repos)
             lines.append(f"## Target repositories ({len(target_repos)})")
             for r in target_repos:
-                url = r.get("target_repo_path", "") if isinstance(r, dict) else r
+                url = r.get("target_repo_path", "")
                 lines.append(f"  - {url}")
+            lines.append("")
+            lines.append("## Per-repository analysis")
+            for r in target_repos:
+                url = r.get("target_repo_path", "")
+                summary = r.get("repo_summary", "").strip()
+                if url:
+                    lines.append(f"\n### Repo: {url}")
+                    lines.append(summary or "(no analysis available)")
 
+        lines.append("")
+        lines.append("## Global implementation steps")
         if repo_info:
             lines.append(f"1. Repository context: {repo_info}")
 
-        requirements = self._extract_requirements(issue)
-
-        for i, req in enumerate(requirements, 1):
+        agent_task = format_agent_task(issue, input_prompt)
+        requirements = self._extract_requirements(agent_task)
+        start = 2 if repo_info else 1
+        for i, req in enumerate(requirements, start):
             lines.append(f"{i}. {req}")
 
         lines.append("---")

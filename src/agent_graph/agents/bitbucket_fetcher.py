@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import requests
 
+from agent_graph.repo_clone import bitbucket_request_kwargs
+
 
 @dataclass
 class BitbucketIssue:
@@ -23,23 +25,21 @@ class BitbucketIssue:
 class BitbucketFetcher:
     """Fetches issues and repo metadata from Bitbucket."""
 
-    API_BASE = "https://api.bitbucket.org/2.0/repos/{owner}/{repo}"
+    API_BASE = "https://api.bitbucket.org/2.0/repositories/{owner}/{repo}"
 
     def __init__(self, token: str | None = None):
         self.token = token or os.getenv("BITBUCKET_TOKEN", "")
 
-    def _auth(self) -> tuple[str, str] | None:
-        if self.token:
-            # Bitbucket uses APP passwords: any username works, but typically
-            # we extract the username from a prompt or use a placeholder.
-            return ("x-token-auth", self.token)
-        return None
-
-    def _headers(self) -> dict:
-        headers = {"Accept": "application/json"}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        return headers
+    def _request_kwargs(self) -> dict:
+        if self.token and self.token != os.getenv("BITBUCKET_TOKEN", ""):
+            return {
+                "headers": {
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {self.token}",
+                },
+                "timeout": 30,
+            }
+        return bitbucket_request_kwargs()
 
     @staticmethod
     def parse_repo_remote(target_repo_path: str = "", bitbucket_issue_url: str = "") -> tuple[str, str]:
@@ -54,7 +54,7 @@ class BitbucketFetcher:
                 except ValueError:
                     pass
             match = re.match(
-                r"(?:https://bitbucket\.org/|git@bitbucket\.com:)([^/]+)/([^/.\s]+)",
+                r"(?:https://bitbucket\.org/|git@bitbucket\.org:)([^/]+)/([^/.\s]+)",
                 source,
             )
             if match:
@@ -94,7 +94,7 @@ class BitbucketFetcher:
         """Get the repository main branch."""
         url = f"{self.API_BASE.format(owner=owner, repo=repo)}/refs/branches"
         params = {"sort": "target.date"}
-        resp = requests.get(url, headers=self._headers(), params=params, timeout=30)
+        resp = requests.get(url, params=params, **self._request_kwargs())
         if resp.status_code not in (200, 201):
             raise RuntimeError(f"Bitbucket API error {resp.status_code}: {resp.text}")
 
@@ -116,13 +116,7 @@ class BitbucketFetcher:
             "pagelen": min(per_page, 100),
             "sort": "-created",
         }
-        resp = requests.get(
-            url,
-            headers=self._headers(),
-            params=params,
-            auth=self._auth(),
-            timeout=30,
-        )
+        resp = requests.get(url, params=params, **self._request_kwargs())
         if resp.status_code not in (200, 201):
             raise RuntimeError(f"Bitbucket API error {resp.status_code}: {resp.text}")
 
@@ -189,13 +183,7 @@ class BitbucketFetcher:
         if reviewers:
             payload["reviewers"] = reviewers
 
-        resp = requests.post(
-            url,
-            headers=self._headers(),
-            json=payload,
-            auth=self._auth(),
-            timeout=30,
-        )
+        resp = requests.post(url, json=payload, **self._request_kwargs())
         if resp.status_code not in (200, 201):
             raise RuntimeError(f"Bitbucket API error {resp.status_code}: {resp.text}")
 

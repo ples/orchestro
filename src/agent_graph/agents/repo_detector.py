@@ -8,6 +8,130 @@ from agent_graph.state import RepoRecord, TaskState
 
 from .base import BaseAgent
 
+# Default service-to-repo name mapping.
+# Extend this with env var REPO_SERVICE_MAP: comma-separated "keyword=repo_name" pairs.
+_COMPONENT_SERVICE_MAP: dict[str, str] = {
+    "minsky identity hub": "identity-hub",
+}
+
+_DEFAULT_SERVICE_MAP: dict[str, str] = {
+    "admin": "admin-ui",
+    "admin ui": "admin-ui",
+    "admin app": "admin-ui",
+    "identity-hub": "identity-hub",
+    "identity hub": "identity-hub",
+    "identity": "identity-hub",
+    "account settings": "account-settings",
+    "accounts": "account-settings",
+    "gateway": "gateway",
+    "auth": "auth-service",
+    "payment": "payment",
+    "notification": "notification",
+    "data": "data-engine",
+}
+
+# Load additional service->repo mappings from env var
+def _load_service_map() -> dict[str, str]:
+    """Combine default map with REPO_SERVICE_MAP env var."""
+    result = dict(_DEFAULT_SERVICE_MAP)
+    raw = os.getenv("REPO_SERVICE_MAP", "").strip()
+    if not raw:
+        return result
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if "=" in pair:
+            key, val = pair.split("=", 1)
+            result[key.strip().lower()] = val.strip()
+    return result
+
+
+def _ambiguous_tokens_blocked(service_map: dict[str, str]) -> frozenset[str]:
+    """Ambiguous tokens to skip unless explicitly set in REPO_SERVICE_MAP."""
+    allowed: set[str] = set()
+    raw = os.getenv("REPO_SERVICE_MAP", "").strip()
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if "=" in pair:
+            key = pair.split("=", 1)[0].strip().lower()
+            if key in _AMBIGUOUS_SERVICE_TOKENS:
+                allowed.add(key)
+    return frozenset(t for t in _AMBIGUOUS_SERVICE_TOKENS if t not in allowed)
+
+
+def _load_explicit_repo_urls() -> dict[str, str]:
+    """Optional slug=url overrides via JIRA_REPO_MAP (comma-separated pairs)."""
+    result: dict[str, str] = {}
+    raw = os.getenv("JIRA_REPO_MAP", "").strip()
+    if not raw:
+        return result
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if "=" in pair:
+            slug, url = pair.split("=", 1)
+            result[slug.strip().lower()] = url.strip()
+    return result
+
+
+def _prefer_bitbucket(platform: str) -> bool:
+    return platform in ("jira", "bitbucket")
+
+
+def service_slug_to_repo_url(slug: str, source_platform: str) -> str | None:
+    """Map a service/repo slug to a clone URL for the given platform."""
+    slug_key = slug.lower().strip()
+    explicit = _load_explicit_repo_urls().get(slug_key)
+    if explicit:
+        return explicit
+
+    bb_owner = os.getenv("BB_DEFAULT_OWNER", "").strip()
+    gh_owner = os.getenv("GH_DEFAULT_OWNER", "").strip()
+
+    if _prefer_bitbucket(source_platform):
+        from agent_graph.agents.bitbucket_catalog import resolve_bitbucket_repo_url
+
+        api_url = resolve_bitbucket_repo_url(slug_key, bb_owner)
+        if api_url:
+            return api_url
+        if bb_owner:
+            return f"https://bitbucket.org/{bb_owner}/{slug_key}.git"
+        return None
+
+    if gh_owner:
+        return f"https://github.com/{gh_owner}/{slug_key}.git"
+    return None
+
+
+# Bare tokens that mean "layer" or "HTTP API" in prose — never match via \bword\b alone.
+_AMBIGUOUS_SERVICE_TOKENS = frozenset({"api", "backend", "frontend"})
+
+# Explicit multi-word / slug patterns (checked before generic keyword fallback).
+_COMPOUND_SERVICE_PATTERNS: list[tuple[str, str]] = [
+    (r"(?i)\bidentity\s+hub\s+api\b", "identity-hub"),
+    (r"(?i)\bidentity-hub-api\b", "identity-hub"),
+    (r"(?i)\badmin-ui-api\b", "admin-ui"),
+    (r"(?i)\badmin\s+ui\s+api\b", "admin-ui"),
+    (r"(?i)\baccount-ui-api\b", "account-settings"),
+    (r"(?i)\bbackend\s+(?:service|repo|repository)\b", "backend"),
+    (r"(?i)\bapi\s+(?:service|repo|repository)\b", "api"),
+]
+
+# Common service keywords used for pattern-matching in issue text
+_SERVICE_KEYWORDS = [
+    "admin",
+    "identity-hub",
+    "identity hub",
+    "gateway",
+    "auth",
+    "auth-service",
+    "payment",
+    "notification",
+    "data-engine",
+    "websocket",
+    "account settings",
+    "admin-ui",
+    "account-settings",
+]
+
 
 def _url_re(text: str) -> list[str]:
     return re.findall(
@@ -55,9 +179,38 @@ class _Entity:
     text_hint: str
 
 
+def _detect_compound_services(text: str) -> list[tuple[str, str]]:
+    """Return (raw_match, repo_slug) for explicit compound patterns only."""
+    hits: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for pattern, slug in _COMPOUND_SERVICE_PATTERNS:
+        for m in re.finditer(pattern, text):
+            key = slug.lower()
+            if key not in seen:
+                seen.add(key)
+                hits.append((m.group(0), slug))
+    return hits
+
+
+def _detect_components(text: str) -> list[_Entity]:
+    entities: list[_Entity] = []
+    service_map = _load_service_map()
+    combined = {**_COMPONENT_SERVICE_MAP, **service_map}
+    for match in re.finditer(r"(?i)components?\s*:\s*([^\n]+)", text):
+        for name in match.group(1).split(","):
+            comp = name.strip().lower()
+            slug = combined.get(comp)
+            if slug:
+                entities.append(
+                    _Entity(kind="service", name=slug, text_hint=f"component: {name.strip()}")
+                )
+    return entities
+
+
 def _detect(text: str) -> list[_Entity]:
     entities: list[_Entity] = []
     seen: set[str] = set()
+    entities.extend(_detect_components(text))
     refs = _ref_re(text)
     urls = _url_re(text)
     orgs = _org_re(text)
@@ -77,13 +230,55 @@ def _detect(text: str) -> list[_Entity]:
             else:
                 entities.append(_Entity(kind=kind, name=ref, text_hint=""))
 
-    services = re.findall(r"(?i)(api|gateway|backend|frontend|auth-service|payment|inventory|notification|data-engine|websocket|identity)", text)
-    services = list(dict.fromkeys(services))
-    for s in services:
-        key = s.lower()
+    service_map = _load_service_map()
+    blocked_ambiguous = _ambiguous_tokens_blocked(service_map)
+
+    found_services: list[tuple[str, str]] = []  # (raw_match, repo_name)
+
+    for raw_match, repo_name in _detect_compound_services(text):
+        if (raw_match, repo_name) not in found_services:
+            found_services.append((raw_match, repo_name))
+
+    # Match longer phrases first (e.g. "admin app" before "admin").
+    service_phrases = sorted(service_map.keys(), key=len, reverse=True)
+    for phrase in service_phrases:
+        if phrase.lower() in blocked_ambiguous:
+            continue
+        pattern = re.compile(
+            r"(?i)(?:^|[\s\-_/,;:.|])(" + re.escape(phrase) + r")(?:\s|$|[\s\-_/,;:.|])"
+        )
+        for m in pattern.finditer(text):
+            repo_name = service_map[phrase]
+            raw_match = m.group(1)
+            if (raw_match, repo_name) not in found_services:
+                found_services.append((raw_match, repo_name))
+
+    # Fallback: individual keywords (skip ambiguous bare tokens).
+    service_keywords_lower = sorted(
+        {kw for kw in _SERVICE_KEYWORDS if kw.lower() not in blocked_ambiguous},
+        key=len,
+        reverse=True,
+    )
+    for kw in service_keywords_lower:
+        if kw.lower() in blocked_ambiguous:
+            continue
+        pattern = re.compile(r"(?i)\b(" + re.escape(kw) + r")\b")
+        m = pattern.search(text)
+        if m:
+            repo_name = service_map.get(kw) or kw
+            if repo_name.lower() in blocked_ambiguous:
+                continue
+            raw_match = m.group(1)
+            if (raw_match, repo_name) not in found_services:
+                found_services.append((raw_match, repo_name))
+
+    for raw_match, repo_name in found_services:
+        key = repo_name.lower()
         if key not in seen:
             seen.add(key)
-            entities.append(_Entity(kind="service", name=s, text_hint=f"service: {s}"))
+            entities.append(
+                _Entity(kind="service", name=repo_name, text_hint=f"service: {raw_match}")
+            )
 
     return entities
 
@@ -127,23 +322,23 @@ def _org_to_repos(org: str, text: str) -> list[tuple[str, str]]:
                     yield org, f"https://github.com/{org}/{slug}.git"
 
     if is_bb_ish:
-        import requests
-        token = os.getenv("BITBUCKET_TOKEN", "")
-        if token:
-            res = requests.get(
-                f"https://api.bitbucket.org/2.0/repositories/{org}/",
-                headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
-                params={"pagelen": 100}, timeout=15,
-            )
-            if res.status_code == 200:
-                for r in res.json().get("values", []):
-                    slug = r.get("name", "").removeprefix(org + "/")
-                    match = any(
-                        re.search(re.sub(r"\*", r".*", s), slug, re.IGNORECASE)
-                        for s in _ref_re(text)
-                    )
-                    if match:
-                        yield org, f"https://bitbucket.org/{org}/{slug}.git"
+        from agent_graph.agents.bitbucket_catalog import BitbucketRepoCatalog
+
+        workspace = org.split("/")[-1] if "/" in org else org
+        catalog = BitbucketRepoCatalog(workspace=workspace)
+        if not catalog.available():
+            return
+        try:
+            for repo in catalog.list_repos():
+                slug = repo.slug
+                match = any(
+                    re.search(re.sub(r"\*", r".*", s), slug, re.IGNORECASE)
+                    for s in _ref_re(text)
+                )
+                if match:
+                    yield workspace, repo.clone_url
+        except RuntimeError as exc:
+            print(f"  [Repo Detector] Bitbucket list failed: {exc}")
 
 
 class RepoDetectorAgent(BaseAgent):
@@ -156,7 +351,10 @@ class RepoDetectorAgent(BaseAgent):
         if not issue:
             return {"target_repos": state.get("target_repos", [])}
 
-        entities = _detect(issue)
+        from agent_graph.state import format_agent_task
+
+        detect_text = format_agent_task(issue, state.get("input_prompt", ""))
+        entities = _detect(detect_text)
         platforms = [state.get("source_platform", "github"), os.getenv("SOURCE_PLATFORM", "github")]
 
         records: list[RepoRecord] = []
@@ -187,17 +385,33 @@ class RepoDetectorAgent(BaseAgent):
                         print(f"  [Repo Detector] Detected repo (org lookup): {repo_url}")
 
             elif ent.kind == "service":
+                service_name = ent.name.lower()
+                resolved = False
                 for prefix in _ref_re(issue) + _url_re(issue):
-                    if f"/{ent.name.lower()}" in prefix.lower():
+                    if service_name in prefix.lower():
                         url = next((u for u in _url_re(issue) if prefix in u), prefix)
                         if url and url not in seen_urls:
-                            # try to turn owner/repo into full URL
                             if "github.com" not in url and "bitbucket.org" not in url:
-                                url = f"https://github.com/{url}"
+                                host = (
+                                    "bitbucket.org"
+                                    if _prefer_bitbucket(platforms[0])
+                                    else "github.com"
+                                )
+                                url = f"https://{host}/{url.lstrip('/')}"
                             records.append({"target_repo_path": url})
                             seen_urls.add(url)
                             print(f"  [Repo Detector] Detected repo (service match): {url}")
+                            resolved = True
                             break
+                if not resolved:
+                    platform = platforms[0]
+                    url = service_slug_to_repo_url(service_name, platform)
+                    if url and url not in seen_urls:
+                        records.append({"target_repo_path": url})
+                        seen_urls.add(url)
+                        print(
+                            f"  [Repo Detector] Resolved service '{service_name}' -> {url}"
+                        )
 
         if not records:
             records = self._ask_for_repos(issue, seen_urls)

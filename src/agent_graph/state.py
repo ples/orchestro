@@ -18,6 +18,7 @@ class RepoRecord(TypedDict, total=False):
     """Per-repo execution and PR result record."""
 
     target_repo_path: str
+    planner_clone_path: str
     work_repo_path: str
     repo_baseline_sha: str
     diff_patch: str
@@ -25,6 +26,8 @@ class RepoRecord(TypedDict, total=False):
     pr_url: str
     pr_error: str
     pr_skip_reason: str
+    deploy_tag_name: str
+    deploy_tag_error: str
     repo_summary: str
 
 
@@ -36,6 +39,7 @@ class TaskState(TypedDict, total=False):
     """
 
     issue: str
+    input_prompt: str
     plan: str
     implementation_result: str
     verification_result: str
@@ -49,7 +53,26 @@ class TaskState(TypedDict, total=False):
     bitbucket_issue_url: str
     pr_url: str  # aggregated (multi-line) URL of created PRs
     pr_error: str  # aggregated (multi-line) PR errors
+    pr_skip_reason: str  # aggregated (multi-line) PR skip reasons
+    deploy_env: str
+    deploy_tag_name: str  # aggregated deploy env tag names
+    deploy_tag_error: str  # aggregated deploy tag errors
     chat_id: str
     workflow_node: WorkflowNodeType
     error_message: str
     repo_context: str
+    mcp_context: str
+    mcp_tools_used: list[str]
+
+
+def format_agent_task(issue: str, input_prompt: str = "") -> str:
+    """Issue text plus optional developer instructions for LLM agents."""
+    issue = issue or ""
+    prompt = (input_prompt or "").strip()
+    if not prompt:
+        return issue
+    return (
+        f"{issue}\n\n"
+        "## Developer instructions (override ticket scope when they conflict)\n\n"
+        f"{prompt}"
+    )

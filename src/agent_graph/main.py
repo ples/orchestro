@@ -10,15 +10,62 @@ from dotenv import load_dotenv
 
 from agent_graph.agents.bitbucket_fetcher import BitbucketFetcher
 from agent_graph.agents.github_fetcher import GitHubFetcher
-from agent_graph.agents.jira_fetcher import JiraFetcher
+from agent_graph.agents.jira_fetcher import JiraFetcher, format_jira_issue_context
+from agent_graph.agents.jira_mcp_fetcher import McpJiraFetcher
 from agent_graph.agents.planner import PlannerAgent
 from agent_graph.agents.verifier import VerifierAgent
 from agent_graph.cli_output import print_final_result
+from agent_graph.deploy_env import VALID_DEPLOY_ENVS, normalize_deploy_env, resolve_deploy_env
 from agent_graph.graph_builder import build_graph
 from agent_graph.state import TaskState
 
 
 load_dotenv()
+
+# URL detection patterns for auto-classification of --issue input
+_JIRA_URL_PATTERN = re.compile(
+    r"https?://[^/\s]+\.atlassian\.net/browse/([A-Za-z0-9]+(-[A-Za-z0-9]+)*)-(\d+)"
+)
+_GITHUB_URL_PATTERN = re.compile(
+    r"https?://github\.com/([^/]+)/([^/]+)/issues/(\d+)"
+)
+_BITBUCKET_URL_PATTERN = re.compile(
+    r"https?://(?:[^/\s]+bitbucket\.org|bitbucket\.org)/([^/]+)/([^/]+)/issues/(\d+)"
+)
+
+
+def _jira_use_mcp(cli_flag: bool) -> bool:
+    if cli_flag:
+        return True
+    return os.getenv("JIRA_USE_MCP", "").lower() in ("1", "true", "yes")
+
+
+def _create_jira_fetcher(*, use_mcp: bool, token: str):
+    if use_mcp:
+        return McpJiraFetcher()
+    return JiraFetcher(token=token)
+
+
+def _resolve_input_prompt(
+    cli_prompt: str | None,
+    prompt_file: str | None,
+) -> str:
+    parts: list[str] = []
+    if prompt_file:
+        path = os.path.expanduser(prompt_file)
+        try:
+            with open(path, encoding="utf-8") as f:
+                parts.append(f.read().strip())
+        except OSError as e:
+            print(f"Error reading --prompt-file {path}: {e}")
+            sys.exit(1)
+    if cli_prompt and cli_prompt.strip():
+        parts.append(cli_prompt.strip())
+    if not parts:
+        env = os.getenv("INPUT_PROMPT", "").strip()
+        if env:
+            parts.append(env)
+    return "\n\n".join(p for p in parts if p)
 
 
 def _parse_repos(value: str | None) -> list[str]:
@@ -30,6 +77,76 @@ def _parse_repos(value: str | None) -> list[str]:
 
 def _build_target_repos(urls: list[str]) -> list[dict]:
     return [{"target_repo_path": url} for url in urls]
+
+
+def classify_input(issue_text: str) -> dict:
+    """Auto-detect whether --issue input is a Jira URL, GitHub URL, Bitbucket URL, or plain text.
+
+    Returns a dict with 'type' key ('jira_url', 'github_url', 'bitbucket_url', or 'plain_text')
+    plus extracted fields.
+    """
+    jira_match = _JIRA_URL_PATTERN.search(issue_text)
+    if jira_match:
+        full_key = f"{jira_match.group(1)}-{jira_match.group(3)}"
+        return {
+            "type": "jira_url",
+            "issue_key": full_key,
+            "project_key": jira_match.group(1),
+        }
+
+    github_match = _GITHUB_URL_PATTERN.search(issue_text)
+    if github_match:
+        return {
+            "type": "github_url",
+            "owner": github_match.group(1),
+            "repo": github_match.group(2),
+            "number": int(github_match.group(3)),
+        }
+
+    bb_match = _BITBUCKET_URL_PATTERN.search(issue_text)
+    if bb_match:
+        return {
+            "type": "bitbucket_url",
+            "owner": bb_match.group(1),
+            "repo": bb_match.group(2),
+            "number": int(bb_match.group(3)),
+        }
+
+    return {"type": "plain_text"}
+
+
+def _resolve_jira_site(issue_key: str, cli_flag_mcp: bool) -> str:
+    """Return the appropriate Jira site/MCP fetcher context."""
+    if _jira_use_mcp(cli_flag_mcp):
+        # MCP fetcher reads JIRA_SITE from env
+        return os.getenv("JIRA_SITE", "")
+    # REST API needs JIRA_SITE too
+    return os.getenv("JIRA_SITE", "")
+
+
+def _fetch_jira_issue_by_key(issue_key: str, use_mcp: bool) -> tuple[str, str]:
+    """Fetch a specific Jira issue by key and return (formatted_context, url).
+
+    Uses Atlassian MCP if use_mcp=True (respects JIRA_USE_MCP env var).
+    Falls back to REST API if not.
+    """
+    if use_mcp:
+        print("  Using Atlassian MCP to fetch Jira issue...")
+        try:
+            fetcher = McpJiraFetcher()
+            issue = fetcher.fetch_issue(issue_key)
+            formatted = format_jira_issue_context(issue)
+            print(f"  [MCP] Fetched issue {issue_key} successfully")
+            return formatted, issue.url
+        except Exception as e:
+            print(f"  [MCP] Failed to fetch via MCP ({e}), falling back to REST...")
+
+    # Fallback: REST API
+    print("  Using REST API to fetch Jira issue...")
+    token = os.getenv("JIRA_API_TOKEN") or os.getenv("JIRA_TOKEN", "")
+    fetcher = JiraFetcher(token=token)
+    issue = fetcher.fetch_issue(issue_key)
+    return format_jira_issue_context(issue), issue.url
 
 
 def cli():
@@ -77,6 +194,11 @@ def cli():
         help="Custom JQL query for --jira",
     )
     parser.add_argument(
+        "--jira-mcp",
+        action="store_true",
+        help="Fetch Jira issues via Atlassian MCP instead of REST API",
+    )
+    parser.add_argument(
         "--bitbucket",
         action="store_true",
         help="Fetch issues from Bitbucket",
@@ -87,7 +209,39 @@ def cli():
         default=None,
         help="Bitbucket repository in owner/repo format (required with --bitbucket)",
     )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Developer instructions / extra context for implementation (overrides ticket scope)",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        type=str,
+        default=None,
+        help="Path to a file with developer instructions (combined with --prompt)",
+    )
+    parser.add_argument(
+        "--deploy-env",
+        type=str,
+        default=None,
+        help=(
+            "Deployment environment for env.*.branch.* git tag after push "
+            f"({', '.join(sorted(VALID_DEPLOY_ENVS))}); also DEPLOY_ENV env or prompt"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.deploy_env and normalize_deploy_env(args.deploy_env) is None:
+        valid = ", ".join(sorted(VALID_DEPLOY_ENVS))
+        print(f"Error: invalid --deploy-env '{args.deploy_env}'. Valid: {valid}")
+        sys.exit(1)
+
+    input_prompt = _resolve_input_prompt(args.prompt, args.prompt_file)
+    if input_prompt:
+        preview = input_prompt[:120]
+        suffix = "..." if len(input_prompt) > 120 else ""
+        print(f"Developer instructions: {preview}{suffix}")
 
     issue_text = args.issue
     github_url = ""
@@ -100,6 +254,33 @@ def cli():
     # --repo flag always adds to target_repos
     cli_repos = _parse_repos(args.repo)
 
+    # Auto-detect platform from --issue input (Jira URL, GitHub URL, Bitbucket URL)
+    classification = classify_input(args.issue)
+    if classification["type"] == "jira_url":
+        source_platform = "jira"
+        jira_issue_key = classification["issue_key"]
+        print(f"  [Auto-detected] Jira URL in --issue: {jira_issue_key}")
+        use_mcp = _jira_use_mcp(args.jira_mcp)
+        if use_mcp:
+            print("  [Auto] Will use Atlassian MCP for Jira")
+        try:
+            issue_text, jira_url = _fetch_jira_issue_by_key(
+                jira_issue_key, use_mcp=use_mcp
+            )
+        except Exception as e:
+            print(f"Error fetching Jira issue {jira_issue_key}: {e}")
+            return
+
+    elif classification["type"] == "github_url":
+        source_platform = "github"
+        # GitHub is the default platform — nothing extra needed; the
+        # planner's RepoDetectorAgent will extract repo info from context.
+        print(f"  [Auto-detected] GitHub URL in --issue")
+
+    elif classification["type"] == "bitbucket_url":
+        source_platform = "bitbucket"
+        print(f"  [Auto-detected] Bitbucket URL in --issue")
+
     if args.jira:
         source_platform = "jira"
         jira_project = args.jira_project or os.getenv("JIRA_PROJECT", "")
@@ -111,7 +292,12 @@ def cli():
             return
 
         token = os.getenv("JIRA_API_TOKEN", "")
-        jira_fetcher = JiraFetcher(token=token)
+        jira_fetcher = _create_jira_fetcher(
+            use_mcp=_jira_use_mcp(args.jira_mcp),
+            token=token,
+        )
+        if _jira_use_mcp(args.jira_mcp):
+            print("  Using Atlassian MCP for Jira")
 
         if jira_project and not jql_query:
             jql_query = jira_fetcher.suggest_jql(jira_project)
@@ -282,8 +468,27 @@ def cli():
 
     target_repos = _build_target_repos(cli_repos)
 
+    deploy_env = resolve_deploy_env(
+        cli=args.deploy_env,
+        issue=issue_text,
+        input_prompt=input_prompt,
+        env_var=os.getenv("DEPLOY_ENV"),
+    )
+    if deploy_env:
+        if args.deploy_env:
+            source = "CLI"
+        elif os.getenv("DEPLOY_ENV", "").strip():
+            source = "DEPLOY_ENV"
+        else:
+            source = "prompt/issue"
+        print(f"Deploy environment: {deploy_env} (from {source})")
+
     initial_state: TaskState = {
         "issue": issue_text,
+        "input_prompt": input_prompt,
+        "deploy_env": deploy_env or "",
+        "deploy_tag_name": "",
+        "deploy_tag_error": "",
         "plan": "",
         "implementation_result": "",
         "verification_result": "",

@@ -1,6 +1,9 @@
 """Per-repo executor loop: runs OpenHands for each target repository."""
 
+import os
+
 from agent_graph.exceptions import ExecutorError
+from agent_graph.pr_skip import NO_CHANGES_SKIP
 from agent_graph.state import RepoRecord, TaskState
 
 from .base import BaseAgent
@@ -15,6 +18,7 @@ class ExecutorLoopAgent(BaseAgent):
         target_repos = state.get("target_repos", [])
         plan = state.get("plan", "")
         issue = state.get("issue", "")
+        input_prompt = state.get("input_prompt", "")
 
         if not target_repos:
             print("\n[Executor Loop] No repos to execute. Running OpenHands with no specific repo.")
@@ -27,50 +31,98 @@ class ExecutorLoopAgent(BaseAgent):
         updated_repos: list[RepoRecord] = []
         all_errors: list[str] = []
 
-        for i, repo_record in enumerate(target_repos):
-            target = repo_record.get("target_repo_path", "")
-            summary = repo_record.get("repo_summary", "")
-            if not target:
-                print(f"  [Repo {i+1}/{len(target_repos)}] Skipped (no target)")
-                updated_repos.append(repo_record)
-                continue
+        from agent_graph.openhands_client import (
+            AgentServerSession,
+            OpenHandsClient,
+            reuse_agent_server,
+        )
 
-            if summary and not target.startswith("https://") and not target.startswith("http://") and not target.startswith("git@"):
-                print(f"  [Repo {i+1}/{len(target_repos)}] Skipped local path (no work needed): {target}")
-                updated_repos.append(repo_record)
-                continue
+        client = OpenHandsClient()
+        runtime_err = client.check_runtime_ready()
+        skip_health_checks = runtime_err is None
 
-            print(f"  [Repo {i+1}/{len(target_repos)}] Target: {target}")
-
-            if summary:
-                sub_plan = f"{plan}\n\n## Repo-specific sub-task\n\n{summary}"
-            else:
-                sub_plan = plan
-
-            try:
-                result = _run_single(
-                    target_repo=target,
-                    issue=issue,
-                    plan=sub_plan,
-                    repo_record=repo_record,
-                    repos_dot=repos_dot,
+        session: AgentServerSession | None = None
+        if reuse_agent_server() and not runtime_err and len(target_repos) > 1:
+            mounts = []
+            for repo_record in target_repos:
+                clone_path = repo_record.get("planner_clone_path", "")
+                if clone_path and os.path.isdir(clone_path):
+                    mounts.append((clone_path, os.path.basename(clone_path)))
+            if mounts:
+                session = AgentServerSession(
+                    client, mounts, skip_health_checks=skip_health_checks
                 )
-                updated_repos.append(result)
-                err = result.get("pr_error", "")
-                print(f"    Result: {'ok' if not err else err}")
-            except ExecutorError as e:
-                err_record = dict(repo_record)
-                err_record["pr_error"] = f"ExecutorError: {e}"
-                err_record["pr_skip_reason"] = f"Execution failed: {e}"
-                updated_repos.append(err_record)
-                all_errors.append(f"{target}: {e}")
-                print(f"    Error: {e}")
-            except RuntimeError as e:
-                err_record = dict(repo_record)
-                err_record["pr_error"] = str(e)
-                updated_repos.append(err_record)
-                all_errors.append(f"{target}: {e}")
-                print(f"    Error: {e}")
+                try:
+                    session.start()
+                    print("  [Executor Loop] Reusing shared agent-server container")
+                except Exception as exc:
+                    print(f"  [Executor Loop] Shared agent server unavailable: {exc}")
+                    session = None
+
+        try:
+            for i, repo_record in enumerate(target_repos):
+                target = repo_record.get("target_repo_path", "")
+                summary = repo_record.get("repo_summary", "")
+                if not target:
+                    print(f"  [Repo {i+1}/{len(target_repos)}] Skipped (no target)")
+                    updated_repos.append(repo_record)
+                    continue
+
+                print(f"  [Repo {i+1}/{len(target_repos)}] Target: {target}")
+
+                if runtime_err:
+                    err_record = dict(repo_record)
+                    err_record["pr_error"] = f"Execution skipped: {runtime_err}"
+                    err_record["pr_skip_reason"] = runtime_err
+                    updated_repos.append(err_record)
+                    all_errors.append(f"{target}: {runtime_err}")
+                    print(f"    Skipped: {runtime_err}")
+                    continue
+
+                clone_path = repo_record.get("planner_clone_path", "")
+                baseline = repo_record.get("repo_baseline_sha", "")
+                if clone_path:
+                    print(f"    Reusing planner clone: {clone_path}")
+
+                sub_plan = (
+                    f"{plan}\n\n## Repo-specific sub-task\n\n{summary}"
+                    if summary
+                    else plan
+                )
+
+                try:
+                    result = _run_single(
+                        target_repo=target,
+                        issue=issue,
+                        input_prompt=input_prompt,
+                        plan=sub_plan,
+                        repo_record=repo_record,
+                        repos_dot=repos_dot,
+                        existing_repo_path=clone_path or None,
+                        baseline_sha=baseline or None,
+                        skip_health_checks=skip_health_checks,
+                        session=session,
+                        client=client,
+                    )
+                    updated_repos.append(result)
+                    err = result.get("pr_error", "")
+                    print(f"    Result: {err if err else 'ok'}")
+                except ExecutorError as e:
+                    err_record = dict(repo_record)
+                    err_record["pr_error"] = f"ExecutorError: {e}"
+                    err_record["pr_skip_reason"] = f"Execution failed: {e}"
+                    updated_repos.append(err_record)
+                    all_errors.append(f"{target}: {e}")
+                    print(f"    Error: {e}")
+                except RuntimeError as e:
+                    err_record = dict(repo_record)
+                    err_record["pr_error"] = str(e)
+                    updated_repos.append(err_record)
+                    all_errors.append(f"{target}: {e}")
+                    print(f"    Error: {e}")
+        finally:
+            if session is not None:
+                session.stop()
 
         if all_errors:
             print(f"  [Executor Loop] {len(all_errors)} repo(s) had errors.")
@@ -84,10 +136,17 @@ def _run_single(
     plan: str,
     repo_record: RepoRecord,
     repos_dot: str = "",
+    input_prompt: str = "",
+    existing_repo_path: str | None = None,
+    baseline_sha: str | None = None,
+    skip_health_checks: bool = False,
+    session=None,
+    client=None,
 ) -> RepoRecord:
     from agent_graph.openhands_client import OpenHandsClient
 
-    client = OpenHandsClient()
+    if client is None:
+        client = OpenHandsClient()
     summary = repos_dot.strip() if repos_dot else ""
 
     if summary:
@@ -99,20 +158,33 @@ def _run_single(
         summary = f"\n\nApply changes to this repository: {target_repo}"
 
     full_plan = plan + summary
-    result = client.run_task(target_repo=target_repo, issue=issue, plan=full_plan)
+    result = client.run_task(
+        target_repo=target_repo,
+        issue=issue,
+        plan=full_plan,
+        existing_repo_path=existing_repo_path,
+        baseline_sha=baseline_sha,
+        skip_health_checks=skip_health_checks,
+        input_prompt=input_prompt,
+        session=session,
+    )
 
     updated = dict(repo_record)
-    updated["work_repo_path"] = result.work_repo_path or ""
-    updated["repo_baseline_sha"] = result.repo_baseline_sha or ""
+    updated["work_repo_path"] = result.work_repo_path or existing_repo_path or ""
+    updated["repo_baseline_sha"] = result.repo_baseline_sha or baseline_sha or ""
     updated["diff_patch"] = result.diff_patch or ""
     updated["change_stat"] = result.change_stat or ""
-    updated["repo_summary"] = summary if not result.success else ""
 
-    if not result.success:
+    if result.no_changes:
+        updated["pr_skip_reason"] = NO_CHANGES_SKIP
+        updated["pr_error"] = ""
+        if result.summary:
+            updated["repo_summary"] = result.summary
+    elif not result.success:
         updated["pr_error"] = result.summary or "OpenHands execution failed"
         updated["pr_skip_reason"] = result.summary or "Executor returned failure"
     else:
-        updated["repo_summary"] = result.summary or ""
+        updated["repo_summary"] = result.summary or updated.get("repo_summary", "")
 
     return updated
 
@@ -121,6 +193,7 @@ def _fallback_single(state: TaskState) -> dict:
     return _run_single(
         target_repo=state.get("target_repo_path", "") or state.get("github_issue_url", "") or "",
         issue=state.get("issue", ""),
+        input_prompt=state.get("input_prompt", ""),
         plan=state.get("plan", ""),
         repo_record={},
     )
