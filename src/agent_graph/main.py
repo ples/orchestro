@@ -8,6 +8,10 @@ import sys
 
 from dotenv import load_dotenv
 
+from agent_graph.logging_config import configure_logging
+
+configure_logging()
+
 from agent_graph.agents.bitbucket_fetcher import BitbucketFetcher
 from agent_graph.agents.github_fetcher import GitHubFetcher
 from agent_graph.agents.jira_fetcher import JiraFetcher, format_jira_issue_context

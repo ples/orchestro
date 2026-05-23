@@ -63,21 +63,26 @@ def test_happy_path_uncommitted():
             "agent_graph.agents.pr_creator.has_uncommitted_changes", return_value=True
         ):
             with patch.object(PrCreatorAgent, "_git"):
-                with patch.dict("os.environ", {"GITHUB_TOKEN": "ghp_test"}):
-                    with patch(
-                        "agent_graph.agents.pr_creator.GitHubFetcher"
-                    ) as mock_fetcher_cls:
-                        mock_fetcher_cls.parse_repo_remote.return_value = (
-                            "acme",
-                            "app",
-                        )
-                        mock_fetcher = MagicMock()
-                        mock_fetcher_cls.return_value = mock_fetcher
-                        mock_fetcher.get_default_branch.return_value = "main"
-                        mock_fetcher.create_pull_request.return_value = (
-                            "https://github.com/acme/app/pull/99"
-                        )
-                        result = agent.run(_state())
+                with patch.object(
+                    PrCreatorAgent,
+                    "_checkout_branch",
+                    return_value="hotfix/login-bug",
+                ):
+                    with patch.dict("os.environ", {"GITHUB_TOKEN": "ghp_test"}):
+                        with patch(
+                            "agent_graph.agents.pr_creator.GitHubFetcher"
+                        ) as mock_fetcher_cls:
+                            mock_fetcher_cls.parse_repo_remote.return_value = (
+                                "acme",
+                                "app",
+                            )
+                            mock_fetcher = MagicMock()
+                            mock_fetcher_cls.return_value = mock_fetcher
+                            mock_fetcher.get_default_branch.return_value = "main"
+                            mock_fetcher.create_pull_request.return_value = (
+                                "https://github.com/acme/app/pull/99"
+                            )
+                            result = agent.run(_state())
 
     assert result["pr_url"] == "https://github.com/acme/app/pull/99"
     assert result["pr_error"] == ""
@@ -95,21 +100,26 @@ def test_happy_path_agent_already_committed():
                 "agent_graph.agents.pr_creator.commit_count_since", return_value=2
             ):
                 with patch.object(PrCreatorAgent, "_git") as mock_git:
-                    with patch.dict("os.environ", {"GITHUB_TOKEN": "ghp_test"}):
-                        with patch(
-                            "agent_graph.agents.pr_creator.GitHubFetcher"
-                        ) as mock_fetcher_cls:
-                            mock_fetcher_cls.parse_repo_remote.return_value = (
-                                "acme",
-                                "app",
-                            )
-                            mock_fetcher = MagicMock()
-                            mock_fetcher_cls.return_value = mock_fetcher
-                            mock_fetcher.get_default_branch.return_value = "main"
-                            mock_fetcher.create_pull_request.return_value = (
-                                "https://github.com/acme/app/pull/100"
-                            )
-                            result = agent.run(_state(repo_baseline_sha="deadbeef"))
+                    with patch.object(
+                        PrCreatorAgent,
+                        "_checkout_branch",
+                        return_value="hotfix/login-bug",
+                    ):
+                        with patch.dict("os.environ", {"GITHUB_TOKEN": "ghp_test"}):
+                            with patch(
+                                "agent_graph.agents.pr_creator.GitHubFetcher"
+                            ) as mock_fetcher_cls:
+                                mock_fetcher_cls.parse_repo_remote.return_value = (
+                                    "acme",
+                                    "app",
+                                )
+                                mock_fetcher = MagicMock()
+                                mock_fetcher_cls.return_value = mock_fetcher
+                                mock_fetcher.get_default_branch.return_value = "main"
+                                mock_fetcher.create_pull_request.return_value = (
+                                    "https://github.com/acme/app/pull/100"
+                                )
+                                result = agent.run(_state(repo_baseline_sha="deadbeef"))
 
     assert result["pr_url"] == "https://github.com/acme/app/pull/100"
     commit_calls = [c for c in mock_git.call_args_list if c[0][1] == "commit"]

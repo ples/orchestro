@@ -129,6 +129,64 @@ def test_planner_continues_on_clone_failure(mock_clone, mock_client_cls):
     assert "Clone failed" in result["target_repos"][0]["repo_summary"]
 
 
+def test_extract_markdown_section():
+    text = "## Findings\nroot cause\n\n## Implementation steps\n1. Fix API\n"
+    assert PlannerAgent._extract_markdown_section(text, "Findings") == "root cause"
+    assert PlannerAgent._extract_markdown_section(text, "Implementation steps") == "1. Fix API"
+    assert PlannerAgent._extract_markdown_section(text, "Missing") == ""
+
+
+def test_plan_context_without_static_scans():
+    ctx = (
+        "Context7 docs for React\n\n"
+        "### Cross-repo overview\nShared API\n\n"
+        "### Static scan: https://x.git\n8000 lines of tree"
+    )
+    filtered = PlannerAgent._plan_context_without_static_scans(ctx)
+    assert "Cross-repo overview" in filtered
+    assert "Context7 docs" in filtered
+    assert "Static scan" not in filtered
+    assert "8000 lines" not in filtered
+
+
+def test_aggregate_implementation_plan():
+    repos = [
+        {
+            "target_repo_path": "https://bitbucket.org/dmetrics/identity-hub-api.git",
+            "repo_summary": (
+                "## Findings\nMissing field\n\n"
+                "## Implementation steps\n1. Add emailVerified to DTO\n"
+            ),
+        },
+    ]
+    ctx = "### Cross-repo overview\n## Suggested per-repo focus\nFix backend first"
+    agg = PlannerAgent._aggregate_implementation_plan(repos, ctx)
+    assert "Suggested per-repo focus" in agg
+    assert "Add emailVerified" in agg
+    assert "identity-hub-api.git" in agg
+
+
+def test_build_plan_includes_implementation_plan_section():
+    agent = PlannerAgent()
+    repos = [
+        {
+            "target_repo_path": "https://bitbucket.org/dmetrics/admin-ui.git",
+            "repo_summary": "## Implementation steps\n1. No UI change needed",
+        },
+    ]
+    plan = agent._build_plan(
+        "MINSKY-1: email flag",
+        "",
+        "### Cross-repo overview\nBackend fix only",
+        repos,
+        input_prompt="Deploy to dev1",
+    )
+    assert "## Implementation plan" in plan
+    assert "No UI change needed" in plan
+    assert "Static scan" not in plan
+    assert "Deploy to dev1" in plan
+
+
 def test_analyse_repo_uses_compact_summary_for_large_repos(tmp_path):
     src = tmp_path / "src" / "main" / "java" / "com" / "example"
     src.mkdir(parents=True)

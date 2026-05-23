@@ -2,6 +2,8 @@ import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+from agent_graph.logging_config import debug, step
+
 if TYPE_CHECKING:
     from agent_graph.state import TaskState
 
@@ -31,9 +33,11 @@ class BaseAgent(AgentProtocol):
     def run(self, state: "TaskState") -> dict:
         """Wraps _execute with logging and error handling."""
         try:
-            logger.info("[%s] Starting agent.", self.name)
+            step(f"[{self.name}] starting")
+            debug(f"[{self.name}] starting")
             result = self._execute(state)
-            logger.info("[%s] Completed successfully.", self.name)
+            step(f"[{self.name}] completed")
+            debug(f"[{self.name}] completed")
             return result
         except Exception as e:
             msg = f"[{self.__class__.__name__}] Error: {e}"

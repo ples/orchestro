@@ -91,22 +91,35 @@ class BitbucketFetcher:
         raise ValueError(f"Cannot parse Bitbucket URL: {url}")
 
     def get_default_branch(self, owner: str, repo: str) -> str:
-        """Get the repository main branch."""
-        url = f"{self.API_BASE.format(owner=owner, repo=repo)}/refs/branches"
-        params = {"sort": "target.date"}
-        resp = requests.get(url, params=params, **self._request_kwargs())
-        if resp.status_code not in (200, 201):
-            raise RuntimeError(f"Bitbucket API error {resp.status_code}: {resp.text}")
+        """Get the repository default branch (master/main)."""
+        override = os.getenv("BITBUCKET_PR_BASE_BRANCH", "")
+        if override:
+            return override
 
-        data = resp.json()
-        branches = data.get("values", [])
-        for branch in branches:
-            if branch.get("mainbranch"):
-                return branch["name"]
-        if branches:
-            # Default to first branch if none marked as main
-            return branches[0]["name"]
-        raise RuntimeError(f"No branches found for {owner}/{repo}")
+        url = self.API_BASE.format(owner=owner, repo=repo)
+        resp = requests.get(url, **self._request_kwargs())
+        if resp.status_code in (200, 201):
+            mainbranch = resp.json().get("mainbranch") or {}
+            name = (mainbranch.get("name") or "").strip()
+            if name:
+                return name
+
+        for candidate in ("master", "main"):
+            if self._branch_exists(owner, repo, candidate):
+                return candidate
+
+        raise RuntimeError(
+            f"Could not resolve default branch for {owner}/{repo} "
+            "(set BITBUCKET_PR_BASE_BRANCH)"
+        )
+
+    def _branch_exists(self, owner: str, repo: str, branch: str) -> bool:
+        url = (
+            f"{self.API_BASE.format(owner=owner, repo=repo)}"
+            f"/refs/branches/{branch}"
+        )
+        resp = requests.get(url, **self._request_kwargs())
+        return resp.status_code in (200, 201)
 
     def fetch_issues(self, owner: str, repo: str, per_page: int = 10) -> list[BitbucketIssue]:
         """Fetch issues from a Bitbucket repository."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 
 _HOTFIX_TYPES = frozenset(
     {
@@ -127,10 +128,112 @@ def current_branch(repo_path: str) -> str | None:
     return branch
 
 
+def ticket_key_slug(issue: str) -> str | None:
+    """Jira-style key from the issue title, e.g. ``minsky-14576``."""
+    title = (issue or "").split("\n", 1)[0]
+    match = re.search(r"\b([A-Z][A-Z0-9]+-\d+)\b", title)
+    return match.group(1).lower() if match else None
+
+
+def branch_exists_local(repo_path: str, branch: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", repo_path, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def list_local_agent_branches(repo_path: str) -> list[str]:
+    result = subprocess.run(
+        ["git", "-C", repo_path, "branch", "--list", "hotfix/*", "feature/*"],
+        capture_output=True,
+        text=True,
+    )
+    branches: list[str] = []
+    for line in result.stdout.splitlines():
+        name = line.strip().lstrip("* ").strip()
+        if is_agent_branch_name(name):
+            branches.append(name)
+    return branches
+
+
+def branch_name_candidates(preferred: str, issue: str = "") -> list[str]:
+    """Ordered branch names to try when *preferred* is unavailable."""
+    seen: set[str] = set()
+    candidates: list[str] = []
+
+    def add(name: str) -> None:
+        if name in seen or not is_agent_branch_name(name):
+            return
+        seen.add(name)
+        candidates.append(name)
+
+    add(preferred)
+    key = ticket_key_slug(issue)
+    if key:
+        add(f"{preferred}-{key}")
+    for n in range(2, 21):
+        add(f"{preferred}-{n}")
+    return candidates
+
+
 def resolve_work_branch(repo_path: str, issue: str, issue_type: str | None = None) -> str:
     """Prefer an existing hotfix/feature branch the agent already created."""
     current = current_branch(repo_path)
     if current and is_agent_branch_name(current):
         return current
-    return build_branch_name(issue, issue_type)
+
+    preferred = build_branch_name(issue, issue_type)
+    if branch_exists_local(repo_path, preferred):
+        return preferred
+
+    existing = list_local_agent_branches(repo_path)
+    prefix = preferred.split("/", 1)[0] + "/"
+    prefix_matches = [b for b in existing if b.startswith(prefix)]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
+    if len(existing) == 1:
+        return existing[0]
+
+    return preferred
+
+
+def checkout_work_branch(
+    repo_path: str,
+    preferred: str,
+    *,
+    issue: str = "",
+) -> str:
+    """Check out a work branch, reusing an existing one or trying suffixed names."""
+    current = current_branch(repo_path)
+    for candidate in branch_name_candidates(preferred, issue):
+        if current == candidate:
+            return candidate
+        if branch_exists_local(repo_path, candidate):
+            _git(repo_path, "checkout", candidate)
+            return candidate
+        try:
+            _git(repo_path, "checkout", "-b", candidate)
+            return candidate
+        except subprocess.CalledProcessError as exc:
+            err = _stderr(exc)
+            if "already exists" in err.lower():
+                continue
+            raise
+    return preferred
+
+
+def _git(repo_path: str, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", repo_path, *args],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _stderr(exc: subprocess.CalledProcessError) -> str:
+    raw = exc.stderr
+    if isinstance(raw, bytes):
+        return raw.decode(errors="replace")
+    return raw or str(exc)
 

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from agent_graph.agents.repo_detector import RepoDetectorAgent
 from agent_graph.exceptions import ExecutorError
+from agent_graph.logging_config import step, verbose_print
 from agent_graph.openhands_client import (
     AgentServerSession,
     OpenHandsClient,
@@ -32,12 +33,11 @@ class PlannerAgent(BaseAgent):
         issue = state["issue"]
         input_prompt = state.get("input_prompt", "")
         agent_task = format_agent_task(issue, input_prompt)
-        print("\n[Planner]")
-        print(f"Analyzing issue: {issue}")
+        step("\n[Planner] analyzing issue")
         if input_prompt.strip():
             preview = input_prompt.strip()[:120]
             suffix = "..." if len(input_prompt.strip()) > 120 else ""
-            print(f"  Developer instructions: {preview}{suffix}")
+            verbose_print(f"  Developer instructions: {preview}{suffix}")
 
         mcp_context = state.get("mcp_context", "")
         mcp_tools_used: list[str] = list(state.get("mcp_tools_used", []))
@@ -49,16 +49,15 @@ class PlannerAgent(BaseAgent):
         repo_info = self._parse_repo_url(github_url) if github_url else ""
 
         target_repos: list[RepoRecord] = list(state.get("target_repos", []))
-        if target_repos:
-            for r in target_repos:
-                print(f"  [Planner] Target repo: {r.get('target_repo_path', '')}")
-
         if not target_repos:
             det = RepoDetectorAgent()
             target_repos = det.run(state).get("target_repos", [])
 
-        for r in target_repos:
-            print(f"  [Planner] Detected repo: {r.get('target_repo_path', '')}")
+        if target_repos:
+            repos = ", ".join(
+                r.get("target_repo_path", "") for r in target_repos if r.get("target_repo_path")
+            )
+            step(f"  [Planner] repos: {repos}")
 
         repo_context_parts: list[str] = []
         if mcp_context:
@@ -69,7 +68,7 @@ class PlannerAgent(BaseAgent):
                 issue, input_prompt, target_repos, repo_context_parts
             )
         else:
-            print("  [Planner] No target repositories — building plan from issue text only")
+            step("  [Planner] no target repositories — plan from issue text only")
             repo_context_parts.append(
                 "(No repositories detected — planner working without repo context)"
             )
@@ -78,6 +77,8 @@ class PlannerAgent(BaseAgent):
         plan = self._build_plan(
             issue, repo_info, repo_context, target_repos, input_prompt=input_prompt
         )
+        step("\n[Planner] plan ready")
+        self._print_plan_preview(plan)
 
         return {
             "plan": plan,
@@ -110,7 +111,7 @@ class PlannerAgent(BaseAgent):
         if not urls:
             return list(target_repos)
 
-        print(f"\n  [Planner] Phase 1: cloning {len(urls)} repositories...")
+        step(f"\n  [Planner] phase 1: cloning {len(urls)} repositories")
         try:
             _parent, clones = clone_planner_workspace(urls)
         except ExecutorError as exc:
@@ -141,7 +142,7 @@ class PlannerAgent(BaseAgent):
         if not prepared:
             return updated
 
-        print(f"\n  [Planner] Phase 2: scanning {len(prepared)} repositories...")
+        step(f"\n  [Planner] phase 2: scanning {len(prepared)} repositories")
         repo_scans: dict[str, str] = {}
         for record, url, clone_path, _baseline in prepared:
             static_context = self._analyse_repo(clone_path)
@@ -149,10 +150,9 @@ class PlannerAgent(BaseAgent):
             if grep_hints:
                 static_context = f"{static_context}\n\n{grep_hints}"
             repo_scans[url] = static_context
-            repo_context_parts.append(f"### Static scan: {url}\n{static_context}")
 
         combined_context = self._build_combined_repo_context(prepared, repo_scans)
-        print("\n  [Planner] Phase 3: cross-repo analysis (big picture)...")
+        step("\n  [Planner] phase 3: cross-repo analysis")
         big_picture = client.run_cross_repo_planning(
             issue, combined_context, input_prompt=input_prompt
         )
@@ -179,13 +179,13 @@ class PlannerAgent(BaseAgent):
             try:
                 session.start()
             except Exception as exc:
-                print(f"  [Planner] Shared agent server failed: {exc}")
+                verbose_print(f"  [Planner] shared agent server failed: {exc}")
                 session = None
 
-        print(f"\n  [Planner] Phase 4: per-repository analysis ({len(prepared)} repos)...")
+        step(f"\n  [Planner] phase 4: per-repo analysis ({len(prepared)} repos)")
         try:
             for i, (record, url, clone_path, baseline) in enumerate(prepared):
-                print(f"\n  [Planner] Repo {i + 1}/{len(prepared)}: {url}")
+                step(f"  [Planner] repo {i + 1}/{len(prepared)}: {url}")
 
                 if runtime_err:
                     record["repo_summary"] = f"Planning skipped: {runtime_err}"
@@ -206,13 +206,14 @@ class PlannerAgent(BaseAgent):
 
                 if result.success:
                     record["repo_summary"] = result.summary
-                    print(f"  [Planner] Analysis complete for {url}")
+                    preview = (result.summary or "").strip().split("\n")[0][:120]
+                    step(f"  [Planner] done {url}: {preview}")
                 else:
                     record["repo_summary"] = (
                         result.summary or "Planning analysis failed"
                     )
-                    print(
-                        f"  [Planner] Analysis failed for {url}: "
+                    step(
+                        f"  [Planner] failed {url}: "
                         f"{record['repo_summary'][:120]}"
                     )
 
@@ -247,14 +248,14 @@ class PlannerAgent(BaseAgent):
 
             return enrich_with_context7_sync(issue)
         except (ImportError, OSError, RuntimeError, ValueError) as exc:
-            print(f"  [MCP] Context7 skipped: {exc}")
+            verbose_print(f"  [MCP] Context7 skipped: {exc}")
             return "", []
 
     def _analyse_repo(self, repo_dir: str) -> str:
         """Walk the repo and produce a dependency-graph string."""
         repo_path = Path(repo_dir)
 
-        print(f"  [Repo] Scanning {repo_path} for source files...")
+        verbose_print(f"  [Repo] scanning {repo_path}")
 
         # 1. Collect all source files
         source_files: list[str] = []
@@ -266,12 +267,15 @@ class PlannerAgent(BaseAgent):
             ext = os.path.splitext(fp)[1]
             ext_counts[ext] = ext_counts.get(ext, 0) + 1
 
-        print(f"  [Repo] Found {len(source_files)} source files ({', '.join(f'{v}{k}' for k, v in ext_counts.items())})")
+        verbose_print(
+            f"  [Repo] {len(source_files)} source files "
+            f"({', '.join(f'{v}{k}' for k, v in ext_counts.items())})"
+        )
 
         if not source_files:
             # Fallback: list the top-level tree
             tree_lines = [str(f.relative_to(repo_path)) for f in sorted(repo_path.iterdir())]
-            print(f"  [Repo] No source files — falling back to directory tree ({len(tree_lines)} entries)")
+            verbose_print(f"  [Repo] no source files — tree ({len(tree_lines)} entries)")
             return "\nRepo tree (no source files found):\n" + "\n".join(f"  {file}" for file in tree_lines)
 
         # 2. Build dependency map: file -> [imported local files]
@@ -290,12 +294,12 @@ class PlannerAgent(BaseAgent):
             for imp in imports:
                 all_imported.add(imp)
 
-        print(f"  [Repo] Parsed {total_parsed} files, found {total_imports_found} local imports")
+        verbose_print(f"  [Repo] parsed {total_parsed} files, {total_imports_found} imports")
 
         # 3. Derive entry points (files with no incoming local imports)
         entry_points = [f for f in dep_map if f not in all_imported]
         entry_points.sort(key=lambda f: (0 if Path(f).stem in ENTRY_POINT_NAMES else 1, f))
-        print(f"  [Repo] Detected {len(entry_points)} entry point(s)")
+        verbose_print(f"  [Repo] {len(entry_points)} entry point(s)")
 
         # 4. Compute depth level via BFS from entry points
         depth_map: dict[str, int] = {}
@@ -329,7 +333,7 @@ class PlannerAgent(BaseAgent):
             if f not in depth_map:
                 depth_map[f] = max_depth + 1
 
-        print(f"  [Repo] Max dependency depth: {max_depth}")
+        verbose_print(f"  [Repo] max dependency depth: {max_depth}")
 
         lines = self._format_repo_context(
             repo_path,
@@ -565,6 +569,90 @@ class PlannerAgent(BaseAgent):
                 return f"{match.group(1)}/{match.group(2)}"
         return ""
 
+    @staticmethod
+    def _extract_markdown_section(text: str, heading: str) -> str:
+        """Return body under a ## heading until the next ## heading."""
+        if not text.strip():
+            return ""
+        pattern = re.compile(
+            rf"^##\s+{re.escape(heading)}\s*$",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        match = pattern.search(text)
+        if not match:
+            return ""
+        start = match.end()
+        next_heading = re.search(r"^##\s+", text[start:], re.MULTILINE)
+        end = start + next_heading.start() if next_heading else len(text)
+        return text[start:end].strip()
+
+    @staticmethod
+    def _plan_context_without_static_scans(repo_context: str) -> str:
+        """Drop per-repo static scan dumps; keep cross-repo overview and MCP context."""
+        if not repo_context.strip():
+            return ""
+        blocks: list[str] = []
+        for block in re.split(r"\n(?=### )", repo_context.strip()):
+            if block.startswith("### Static scan:"):
+                continue
+            blocks.append(block)
+        return "\n\n".join(blocks).strip()
+
+    @staticmethod
+    def _aggregate_implementation_plan(
+        target_repos: list[RepoRecord] | None,
+        repo_context: str,
+    ) -> str:
+        """Collect implementation steps from cross-repo and per-repo analysis."""
+        sections: list[str] = []
+        overview = PlannerAgent._plan_context_without_static_scans(repo_context)
+        for heading in (
+            "Suggested per-repo focus",
+            "Cross-repo findings",
+            "Repo roles",
+        ):
+            body = PlannerAgent._extract_markdown_section(overview, heading)
+            if body:
+                sections.append(f"### {heading}\n{body}")
+
+        if target_repos:
+            for r in target_repos:
+                url = r.get("target_repo_path", "")
+                summary = (r.get("repo_summary") or "").strip()
+                if not url or not summary:
+                    continue
+                repo_parts: list[str] = []
+                for heading in ("Implementation steps", "Proposed changes", "Findings"):
+                    body = PlannerAgent._extract_markdown_section(summary, heading)
+                    if body:
+                        repo_parts.append(f"#### {heading}\n{body}")
+                if repo_parts:
+                    sections.append(f"### {url}\n" + "\n\n".join(repo_parts))
+
+        return "\n\n".join(sections).strip()
+
+    @staticmethod
+    def _print_plan_preview(plan: str, *, max_lines: int = 50) -> None:
+        """Print actionable plan sections; skip static scan dumps."""
+        skip_static = False
+        shown = 0
+        truncated = False
+        for line in plan.splitlines():
+            if line.startswith("### Static scan:"):
+                skip_static = True
+                continue
+            if line.startswith("## ") or line.startswith("### "):
+                skip_static = False
+            if skip_static:
+                continue
+            step(f"  {line}")
+            shown += 1
+            if shown >= max_lines:
+                truncated = True
+                break
+        if truncated:
+            step("  ... (plan continues — set LOG_LEVEL=DEBUG for full plan)")
+
     def _build_plan(
         self,
         issue: str,
@@ -581,9 +669,15 @@ class PlannerAgent(BaseAgent):
             lines.append(input_prompt.strip())
             lines.append("")
 
-        if repo_context.strip():
-            lines.append(repo_context)
+        overview = self._plan_context_without_static_scans(repo_context)
+        if overview:
+            lines.append(overview)
             lines.append("")
+
+        implementation = self._aggregate_implementation_plan(target_repos, repo_context)
+        lines.append("## Implementation plan")
+        lines.append(implementation or "(no structured implementation steps from analysis)")
+        lines.append("")
 
         if target_repos:
             lines.append(f"## Target repositories ({len(target_repos)})")

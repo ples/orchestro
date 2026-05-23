@@ -3,6 +3,7 @@
 import os
 
 from agent_graph.exceptions import ExecutorError
+from agent_graph.logging_config import step, verbose_print
 from agent_graph.pr_skip import NO_CHANGES_SKIP
 from agent_graph.state import RepoRecord, TaskState
 
@@ -21,10 +22,10 @@ class ExecutorLoopAgent(BaseAgent):
         input_prompt = state.get("input_prompt", "")
 
         if not target_repos:
-            print("\n[Executor Loop] No repos to execute. Running OpenHands with no specific repo.")
+            step("\n[Executor Loop] no repos — running without target repo")
             return _fallback_single(state)
 
-        print(f"\n[Executor Loop] Running on {len(target_repos)} repository(ies)...")
+        step(f"\n[Executor Loop] {len(target_repos)} repository(ies)")
 
         repos_dot = _extract_repos_dot(plan, target_repos)
 
@@ -54,9 +55,9 @@ class ExecutorLoopAgent(BaseAgent):
                 )
                 try:
                     session.start()
-                    print("  [Executor Loop] Reusing shared agent-server container")
+                    verbose_print("  [Executor Loop] reusing shared agent-server")
                 except Exception as exc:
-                    print(f"  [Executor Loop] Shared agent server unavailable: {exc}")
+                    verbose_print(f"  [Executor Loop] shared agent server unavailable: {exc}")
                     session = None
 
         try:
@@ -64,11 +65,11 @@ class ExecutorLoopAgent(BaseAgent):
                 target = repo_record.get("target_repo_path", "")
                 summary = repo_record.get("repo_summary", "")
                 if not target:
-                    print(f"  [Repo {i+1}/{len(target_repos)}] Skipped (no target)")
+                    verbose_print(f"  [Repo {i+1}/{len(target_repos)}] skipped (no target)")
                     updated_repos.append(repo_record)
                     continue
 
-                print(f"  [Repo {i+1}/{len(target_repos)}] Target: {target}")
+                step(f"  [Repo {i+1}/{len(target_repos)}] {target}")
 
                 if runtime_err:
                     err_record = dict(repo_record)
@@ -76,13 +77,13 @@ class ExecutorLoopAgent(BaseAgent):
                     err_record["pr_skip_reason"] = runtime_err
                     updated_repos.append(err_record)
                     all_errors.append(f"{target}: {runtime_err}")
-                    print(f"    Skipped: {runtime_err}")
+                    step(f"    skipped: {runtime_err}")
                     continue
 
                 clone_path = repo_record.get("planner_clone_path", "")
                 baseline = repo_record.get("repo_baseline_sha", "")
                 if clone_path:
-                    print(f"    Reusing planner clone: {clone_path}")
+                    verbose_print(f"    reusing planner clone: {clone_path}")
 
                 sub_plan = (
                     f"{plan}\n\n## Repo-specific sub-task\n\n{summary}"
@@ -106,26 +107,26 @@ class ExecutorLoopAgent(BaseAgent):
                     )
                     updated_repos.append(result)
                     err = result.get("pr_error", "")
-                    print(f"    Result: {err if err else 'ok'}")
+                    step(f"    result: {err if err else 'ok'}")
                 except ExecutorError as e:
                     err_record = dict(repo_record)
                     err_record["pr_error"] = f"ExecutorError: {e}"
                     err_record["pr_skip_reason"] = f"Execution failed: {e}"
                     updated_repos.append(err_record)
                     all_errors.append(f"{target}: {e}")
-                    print(f"    Error: {e}")
+                    step(f"    error: {e}")
                 except RuntimeError as e:
                     err_record = dict(repo_record)
                     err_record["pr_error"] = str(e)
                     updated_repos.append(err_record)
                     all_errors.append(f"{target}: {e}")
-                    print(f"    Error: {e}")
+                    step(f"    error: {e}")
         finally:
             if session is not None:
                 session.stop()
 
         if all_errors:
-            print(f"  [Executor Loop] {len(all_errors)} repo(s) had errors.")
+            step(f"  [Executor Loop] {len(all_errors)} repo(s) had errors")
 
         return {"target_repos": updated_repos}
 

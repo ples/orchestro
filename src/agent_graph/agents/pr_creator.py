@@ -28,93 +28,6 @@ class PrCreatorAgent(BaseAgent):
 
         work_repo_path = state.get("work_repo_path", "")
         baseline_sha = state.get("repo_baseline_sha", "")
-
-        if not work_repo_path:
-            reason = "No work repository path from executor."
-            print(f"  Skipping PR: {reason}")
-            return {"pr_url": "", "pr_error": "", "pr_skip_reason": reason}
-
-        info = change_summary(work_repo_path, baseline_sha)
-        print(
-            f"  Git state: baseline={info['baseline_sha']}, "
-            f"uncommitted={info['uncommitted']}, "
-            f"commits_since_baseline={info['commits_since_baseline']}"
-        )
-
-        if not has_changes_since(work_repo_path, baseline_sha):
-            reason = (
-                "No changes detected since workflow baseline.\n"
-                f"  uncommitted={info['uncommitted']}, "
-                f"commits_since_baseline={info['commits_since_baseline']}, "
-                f"baseline={info['baseline_sha']}"
-            )
-            print(f"  Skipping PR: {reason}")
-            if info["diff_stat"] != "(no diff)":
-                print(f"  Diff stat: {info['diff_stat']}")
-            return {"pr_url": "", "pr_error": "", "pr_skip_reason": reason}
-
-        token = os.getenv("GITHUB_TOKEN", "")
-        if not token:
-            raise PrCreationError("GITHUB_TOKEN is required to create a pull request")
-
-        target_repo = state.get("target_repo_path", "")
-        github_issue_url = state.get("github_issue_url", "")
-        try:
-            owner, repo = GitHubFetcher.parse_repo_remote(target_repo, github_issue_url)
-        except ValueError as e:
-            raise PrCreationError(str(e)) from e
-
-        from agent_graph.branch_naming import resolve_work_branch
-
-        issue_number = self._issue_number(github_issue_url)
-        branch = resolve_work_branch(work_repo_path, state.get("issue", ""))
-
-        auth_remote = (
-            f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
-        )
-        git_name = os.getenv("GIT_AUTHOR_NAME", "Agent Graph")
-        git_email = os.getenv("GIT_AUTHOR_EMAIL", "agent@users.noreply.github.com")
-        commit_msg = self._commit_message(state, issue_number)
-
-        try:
-            self._git(work_repo_path, "remote", "set-url", "origin", auth_remote)
-            self._git(work_repo_path, "config", "user.name", git_name)
-            self._git(work_repo_path, "config", "user.email", git_email)
-            self._checkout_branch(work_repo_path, branch)
-            if has_uncommitted_changes(work_repo_path):
-                self._git(work_repo_path, "add", "-A")
-                self._git(work_repo_path, "commit", "-m", commit_msg)
-            elif commit_count_since(work_repo_path, baseline_sha) > 0:
-                print(
-                    f"  Using {commit_count_since(work_repo_path, baseline_sha)} "
-                    "commit(s) already made by the agent"
-                )
-            self._git(work_repo_path, "push", "-u", "origin", branch)
-        except subprocess.CalledProcessError as e:
-            err = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or str(e))
-            print(f"  Git error: {err}")
-            return {"pr_url": "", "pr_error": f"Git push failed: {err}", "pr_skip_reason": ""}
-
-        fetcher = GitHubFetcher(token=token)
-        try:
-            base = fetcher.get_default_branch(owner, repo)
-            title = self._pr_title(state, issue_number)
-            body = self._pr_body(state, issue_number)
-            pr_url = fetcher.create_pull_request(
-                owner, repo, title=title, head=branch, base=base, body=body
-            )
-        except RuntimeError as e:
-            print(f"  PR API error: {e}")
-            return {"pr_url": "", "pr_error": str(e), "pr_skip_reason": ""}
-
-        print(f"  Pull request created: {pr_url}")
-        return {"pr_url": pr_url, "pr_error": "", "pr_skip_reason": ""}
-
-    def _execute(self, state: TaskState) -> dict:
-        print("\n[PR Creator]")
-
-        work_repo_path = state.get("work_repo_path", "")
-        baseline_sha = state.get("repo_baseline_sha", "")
         platform = state.get("source_platform", "github")
 
         if not work_repo_path:
@@ -223,7 +136,9 @@ class PrCreatorAgent(BaseAgent):
             self._git(work_repo_path, "remote", "set-url", "origin", auth_remote)
             self._git(work_repo_path, "config", "user.name", git_name)
             self._git(work_repo_path, "config", "user.email", git_email)
-            self._checkout_branch(work_repo_path, branch)
+            branch = self._checkout_branch(
+                work_repo_path, branch, issue=state.get("issue", "")
+            )
             if has_uncommitted_changes(work_repo_path):
                 self._git(work_repo_path, "add", "-A")
                 self._git(work_repo_path, "commit", "-m", commit_msg)
@@ -283,7 +198,9 @@ class PrCreatorAgent(BaseAgent):
             self._git(work_repo_path, "remote", "set-url", "origin", auth_remote)
             self._git(work_repo_path, "config", "user.name", git_name)
             self._git(work_repo_path, "config", "user.email", git_email)
-            self._checkout_branch(work_repo_path, branch)
+            branch = self._checkout_branch(
+                work_repo_path, branch, issue=state.get("issue", "")
+            )
             if has_uncommitted_changes(work_repo_path):
                 self._git(work_repo_path, "add", "-A")
                 self._git(work_repo_path, "commit", "-m", commit_msg)
@@ -326,15 +243,15 @@ class PrCreatorAgent(BaseAgent):
         issue_line = state.get("issue", "").strip().split("\n")[0][:100]
         return issue_line or "Agent implementation"
 
-    def _checkout_branch(self, repo_path: str, branch: str) -> None:
-        exists = subprocess.run(
-            ["git", "-C", repo_path, "rev-parse", "--verify", branch],
-            capture_output=True,
-        )
-        if exists.returncode == 0:
-            self._git(repo_path, "checkout", branch)
-        else:
-            self._git(repo_path, "checkout", "-b", branch)
+    def _checkout_branch(
+        self, repo_path: str, branch: str, *, issue: str = ""
+    ) -> str:
+        from agent_graph.branch_naming import checkout_work_branch
+
+        checked_out = checkout_work_branch(repo_path, branch, issue=issue)
+        if checked_out != branch:
+            print(f"  Using branch `{checked_out}` (preferred `{branch}` was unavailable)")
+        return checked_out
 
     @staticmethod
     def _git(repo_path: str, *args: str) -> None:

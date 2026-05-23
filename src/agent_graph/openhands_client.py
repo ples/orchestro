@@ -4,6 +4,11 @@ import os
 import platform
 
 import requests
+
+from agent_graph.logging_config import configure_logging, debug, step, verbose_print
+
+configure_logging()
+
 from openhands.sdk import LLM, Agent, Conversation, Tool
 from openhands.sdk.conversation.exceptions import ConversationRunError
 from openhands.sdk.utils.command import execute_command
@@ -68,8 +73,9 @@ class AgentServerSession:
             working_dir="/workspace",
             forward_env=list(LLM_ENV_KEYS),
             volumes=volumes,
+            detach_logs=False,
         )
-        print(
+        step(
             f"  Agent server (shared): {self._workspace.host} "
             f"({len(self._volume_mounts)} repo mount(s))"
         )
@@ -356,7 +362,7 @@ class OpenHandsClient:
                 .strip()
             )
         except Exception as exc:
-            print(f"  [Planner] Local LLM failed: {exc}")
+            step(f"  [Planner] Local LLM failed: {exc}")
             return ""
 
     def _resolve_llm_model_id(self) -> str:
@@ -533,12 +539,12 @@ class OpenHandsClient:
         try:
             ok = execute_command(["docker", "version"]).returncode == 0
             if ok:
-                print("  ✓ Docker available")
+                verbose_print("  ✓ Docker available")
             else:
-                print("  ✗ Docker not available — start Docker Desktop")
+                step("  ✗ Docker not available — start Docker Desktop")
             return ok
         except Exception as e:
-            print(f"  ✗ Docker check failed: {e}")
+            step(f"  ✗ Docker check failed: {e}")
             return False
 
     def _check_llm_health(self, base_url: str | None = None) -> bool:
@@ -549,20 +555,22 @@ class OpenHandsClient:
                 headers["Authorization"] = f"Bearer {self.llm_api_key}"
             resp = requests.get(f"{url}/models", headers=headers, timeout=5)
             if resp.status_code != 200:
-                print(f"  ✗ LLM health check failed: {resp.status_code}")
+                step(f"  ✗ LLM health check failed: {resp.status_code}")
             else:
                 data = resp.json()
                 model_ids = [m["id"] for m in data.get("data", [])]
-                print(f"  ✓ LLM endpoint healthy — {len(model_ids)} models available")
+                verbose_print(
+                    f"  ✓ LLM endpoint healthy — {len(model_ids)} models available"
+                )
                 if any(
                     self.llm_model.lower() in mid.lower() for mid in model_ids
                 ):
-                    print(f"  ✓ Target model found ({self.llm_model})")
+                    verbose_print(f"  ✓ Target model found ({self.llm_model})")
                 else:
-                    print(f"  ⚠ Target model not in list: {model_ids[:5]}")
+                    verbose_print(f"  ⚠ Target model not in list: {model_ids[:5]}")
             return resp.status_code == 200
         except Exception as e:
-            print(f"  ✗ LLM health check failed: {e}")
+            step(f"  ✗ LLM health check failed: {e}")
             return False
 
     def _check_llm_health_in_container(self, workspace: DockerWorkspace) -> bool:
@@ -572,17 +580,17 @@ class OpenHandsClient:
         try:
             result = workspace.execute_command(cmd)
             if result.exit_code == 0:
-                print(f"  ✓ LLM reachable from container ({container_url})")
+                verbose_print(f"  ✓ LLM reachable from container ({container_url})")
                 return True
-            print(
+            step(
                 f"  ✗ LLM not reachable from container ({container_url}), "
                 f"exit={result.exit_code}"
             )
             if result.stderr:
-                print(f"    {result.stderr.strip()}")
+                debug(result.stderr.strip())
             return False
         except Exception as e:
-            print(f"  ✗ Container LLM health check failed: {e}")
+            step(f"  ✗ Container LLM health check failed: {e}")
             return False
 
     def _execute_in_docker_workspace(
@@ -624,14 +632,14 @@ class OpenHandsClient:
                 )
 
         if not skip_health_checks:
-            print(f"\n[{label}]\nDocker check...")
+            verbose_print(f"\n[{label}] Docker check...")
             if not self._check_docker_available():
                 return ExecutionResult(
                     success=False,
                     summary="Docker is not available. Start Docker Desktop and retry.",
                 )
 
-            print(f"\n[{label}]\nLLM health check...")
+            verbose_print(f"\n[{label}] LLM health check...")
             if not self._check_llm_health():
                 return ExecutionResult(
                     success=False,
@@ -642,7 +650,7 @@ class OpenHandsClient:
         if repo_path:
             volumes.append(f"{repo_path}:{workspace_dir}")
 
-        print(f"\n[{label}]\nSpawning agent-server container...")
+        step(f"\n[{label}] Spawning agent-server container...")
         env_backup = self._apply_container_llm_env()
         try:
             with DockerWorkspace(
@@ -651,8 +659,9 @@ class OpenHandsClient:
                 working_dir=workspace_dir,
                 forward_env=list(LLM_ENV_KEYS),
                 volumes=volumes,
+                detach_logs=False,
             ) as workspace:
-                print(f"  Agent server: {workspace.host}")
+                step(f"  Agent server: {workspace.host}")
                 return self._execute_on_workspace(
                     workspace,
                     repo_path=repo_path,
@@ -693,9 +702,9 @@ class OpenHandsClient:
             else self._executor_max_iterations()
         )
         container_llm_url = self.llm_base_url_in_container
-        print(f"  Workspace dir: {workspace_dir}")
-        print(f"  LLM (container): {container_llm_url}")
-        print(f"  Mode: {mode} (max_iterations={max_iterations})")
+        debug(f"  Workspace dir: {workspace_dir}")
+        debug(f"  LLM (container): {container_llm_url}")
+        step(f"  {label}: {mode} (max_iterations={max_iterations})")
 
         if not skip_container_health_check and not self._check_llm_health_in_container(
             workspace
@@ -737,21 +746,21 @@ class OpenHandsClient:
                 if filter_regex:
                     agent_kwargs["filter_tools_regex"] = filter_regex
                 servers = list(mcp_config.get("mcpServers", {}))
-                print(f"  Agent tools: TerminalTool, FileEditorTool + MCP {servers}")
+                debug(f"  Agent tools: TerminalTool, FileEditorTool + MCP {servers}")
             else:
-                print("  Agent tools: TerminalTool, FileEditorTool")
+                debug("  Agent tools: TerminalTool, FileEditorTool")
             agent = Agent(**agent_kwargs)
             conversation = Conversation(
                 agent=agent,
                 workspace=workspace,
                 max_iteration_per_run=max_iterations,
                 stuck_detection=False,
+                visualizer=None,
             )
             try:
-                print("  Sending prompt to agent (new conversation)...")
+                step("  Running OpenHands agent...")
                 conversation.send_message(prompt)
                 conversation.run(blocking=True)
-                print("  Agent completed")
                 agent_summary = self._extract_agent_summary(conversation)
             finally:
                 try:
@@ -768,7 +777,7 @@ class OpenHandsClient:
 
         if mode == "planning":
             summary = agent_summary or "Planning analysis completed"
-            print(f"  Done: {summary[:120]}...")
+            step(f"  Plan summary: {_summary_preview(summary)}")
             return ExecutionResult(
                 success=True,
                 summary=summary,
@@ -784,14 +793,13 @@ class OpenHandsClient:
             else {}
         )
         if info:
-            print(
+            step(
                 f"  Changes: uncommitted={info['uncommitted']}, "
-                f"commits={info['commits_since_baseline']}, "
-                f"baseline={info['baseline_sha']}"
+                f"commits={info['commits_since_baseline']}"
             )
             if stat:
                 for line in stat.splitlines()[:5]:
-                    print(f"    {line}")
+                    debug(f"    {line}")
 
         repo_label = os.path.basename(repo_path) if repo_path else "workspace"
         if (
@@ -803,7 +811,7 @@ class OpenHandsClient:
             summary = (
                 f"No file changes in {repo_label} — OpenHands finished without editing the repo"
             )
-            print(f"  ⚠ {summary}")
+            step(f"  ⚠ {summary}")
             return ExecutionResult(
                 success=True,
                 no_changes=True,
@@ -815,7 +823,7 @@ class OpenHandsClient:
             )
 
         summary = agent_summary or f"Task completed: {repo_label}"
-        print(f"  Done: {summary}")
+        step(f"  Done: {_summary_preview(summary)}")
         return ExecutionResult(
             success=True,
             summary=summary,
@@ -862,3 +870,10 @@ class OpenHandsClient:
         except Exception:
             pass
         return ""
+
+
+def _summary_preview(text: str, max_len: int = 200) -> str:
+    line = (text or "").strip().split("\n")[0]
+    if len(line) > max_len:
+        return line[: max_len - 3] + "..."
+    return line

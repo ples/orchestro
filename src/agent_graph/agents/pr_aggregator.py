@@ -171,7 +171,7 @@ class PrAggregatorAgent(BaseAgent):
             self._git(work_repo, "remote", "set-url", "origin", auth_remote)
             self._git(work_repo, "config", "user.name", git_name)
             self._git(work_repo, "config", "user.email", git_email)
-            self._checkout_branch(work_repo, branch)
+            branch = self._checkout_branch(work_repo, branch, issue=state.get("issue", ""))
             if has_uncommitted_changes(work_repo):
                 self._git(work_repo, "add", "-A")
                 self._git(work_repo, "commit", "-m", commit_msg)
@@ -241,7 +241,7 @@ class PrAggregatorAgent(BaseAgent):
             self._git(work_repo, "remote", "set-url", "origin", auth_remote)
             self._git(work_repo, "config", "user.name", git_name)
             self._git(work_repo, "config", "user.email", git_email)
-            self._git(work_repo, "checkout", "-b", branch)
+            branch = self._checkout_branch(work_repo, branch, issue=state.get("issue", ""))
             if has_uncommitted_changes(work_repo):
                 self._git(work_repo, "add", "-A")
                 self._git(work_repo, "commit", "-m", commit_msg)
@@ -362,15 +362,15 @@ class PrAggregatorAgent(BaseAgent):
     def _git(repo_path: str, *args: str) -> None:
         subprocess.run(["git", "-C", repo_path, *args], check=True, capture_output=True)
 
-    def _checkout_branch(self, work_repo: str, branch: str) -> None:
-        exists = subprocess.run(
-            ["git", "-C", work_repo, "rev-parse", "--verify", branch],
-            capture_output=True,
-        )
-        if exists.returncode == 0:
-            self._git(work_repo, "checkout", branch)
-        else:
-            self._git(work_repo, "checkout", "-B", branch)
+    def _checkout_branch(
+        self, work_repo: str, branch: str, *, issue: str = ""
+    ) -> str:
+        from agent_graph.branch_naming import checkout_work_branch
+
+        checked_out = checkout_work_branch(work_repo, branch, issue=issue)
+        if checked_out != branch:
+            print(f"  Using branch `{checked_out}` (preferred `{branch}` was unavailable)")
+        return checked_out
 
     def _push_branch(
         self,
@@ -492,7 +492,7 @@ class PrAggregatorAgent(BaseAgent):
         auth_remote = f"https://x-access-token:{token}@github.com/{owner}/{repo_name}.git"
         try:
             self._git(work_repo, "remote", "set-url", "origin", auth_remote)
-            self._git(work_repo, "checkout", "-b", branch)
+            branch = self._checkout_branch(work_repo, branch, issue=state.get("issue", ""))
             issue = state.get("issue", "")[:72]
             self._git(work_repo, "add", "-A")
             self._git(
@@ -530,7 +530,7 @@ class PrAggregatorAgent(BaseAgent):
         )
         try:
             self._git(work_repo, "remote", "set-url", "origin", auth_remote)
-            self._git(work_repo, "checkout", "-b", branch)
+            branch = self._checkout_branch(work_repo, branch, issue=state.get("issue", ""))
             issue = state.get("issue", "")[:72]
             self._git(work_repo, "add", "-A")
             self._git(work_repo, "commit", "-m", issue or "Agent changes")

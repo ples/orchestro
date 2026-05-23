@@ -8,6 +8,7 @@ from urllib.parse import quote, urlparse
 
 from agent_graph.exceptions import ExecutorError
 from agent_graph.git_utils import rev_parse
+from agent_graph.logging_config import step, verbose_print
 
 DEFAULT_CLONE_TIMEOUT = 120
 BITBUCKET_GIT_USERNAME = "x-bitbucket-api-token-auth"
@@ -147,22 +148,22 @@ def _clone_into_path(repo_path: str, url: str, *, timeout_sec: int) -> None:
         except subprocess.TimeoutExpired as exc:
             name = os.path.basename(repo_path)
             msg = f"git clone timed out after {timeout_sec}s for {name}"
-            print(f"  [Clone] {msg}")
+            verbose_print(f"  [Clone] {msg}")
             raise ExecutorError(msg) from exc
         except subprocess.CalledProcessError as exc:
             name = os.path.basename(repo_path)
             err = _truncate_stderr(exc.stderr or "")
             msg = f"git clone failed for {name}: {err or exc}"
-            print(f"  [Clone] {msg}")
+            verbose_print(f"  [Clone] {msg}")
             raise ExecutorError(msg) from exc
         else:
             if result.stderr:
-                print(f"  [Clone] {result.stderr.strip()[:200]}")
+                verbose_print(f"  [Clone] {result.stderr.strip()[:200]}")
         return
 
     if not os.path.isdir(url):
         raise ExecutorError(f"Target repo not found: {url}")
-    print(f"  [Clone] Copying local repo {os.path.basename(repo_path)}...")
+    step(f"  [Clone] copy {os.path.basename(repo_path)}")
     os.makedirs(os.path.dirname(repo_path), exist_ok=True)
     subprocess.run(
         ["cp", "-R", f"{url}/.", repo_path],
@@ -190,13 +191,13 @@ def clone_planner_workspace(urls: list[str]) -> tuple[str, dict[str, tuple[str, 
     for i, url in enumerate(valid_urls):
         repo_name = _repo_name_from_url(url)
         repo_path = os.path.join(parent, repo_name)
-        print(f"  [Clone] ({i + 1}/{len(valid_urls)}) Cloning {repo_name}...")
+        step(f"  [Clone] ({i + 1}/{len(valid_urls)}) {repo_name}")
         _clone_into_path(repo_path, url, timeout_sec=timeout_sec)
         baseline = _finalize_clone(repo_path)
         results[url] = (repo_path, baseline)
-        print(f"  [Clone] Ready: {repo_path}")
+        verbose_print(f"  [Clone] ready: {repo_path}")
 
-    print(f"  [Clone] Workspace at {parent} ({len(results)} repositories)")
+    step(f"  [Clone] workspace ready ({len(results)} repos)")
     return parent, results
 
 
@@ -224,9 +225,9 @@ def clone_repository(
     )
     repo_path = os.path.join(tmp_dir, repo_name)
     if _is_remote(url):
-        print(f"  [Clone] Cloning {repo_name}...")
+        step(f"  [Clone] {repo_name}")
     _clone_into_path(repo_path, url, timeout_sec=timeout_sec)
-    print(f"  [Clone] Cloned into {repo_path}")
+    verbose_print(f"  [Clone] cloned into {repo_path}")
     baseline = _finalize_clone(repo_path)
     return repo_path, baseline
 

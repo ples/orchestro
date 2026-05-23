@@ -88,44 +88,50 @@ class TestParseIssueUrl:
 
 
 class TestGetDefaultBranch:
-    def test_get_default_branch_main(self):
+    def test_get_default_branch_from_repo_mainbranch(self):
         fetcher = BitbucketFetcher(token="fake")
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
-            "values": [
-                {"name": "dev"},
-                {"name": "main", "mainbranch": True},
-                {"name": "feature"},
-            ]
+            "mainbranch": {"name": "master", "type": "branch"},
         }
         with patch.object(requests, "get", return_value=mock_response) as mock_get:
             branch = fetcher.get_default_branch("acme", "myapp")
-            assert branch == "main"
-            assert mock_get.call_args[1]["params"] == {"sort": "target.date"}
+            assert branch == "master"
             assert mock_get.call_args[0][0] == (
-                "https://api.bitbucket.org/2.0/repositories/acme/myapp/refs/branches"
+                "https://api.bitbucket.org/2.0/repositories/acme/myapp"
             )
 
-    def test_get_default_branch_first_fallback(self):
+    def test_get_default_branch_env_override(self, monkeypatch):
+        monkeypatch.setenv("BITBUCKET_PR_BASE_BRANCH", "main")
         fetcher = BitbucketFetcher(token="fake")
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "values": [
-                {"name": "develop"},
-            ]
-        }
-        with patch.object(requests, "get", return_value=mock_response):
+        with patch.object(requests, "get") as mock_get:
             branch = fetcher.get_default_branch("acme", "myapp")
-            assert branch == "develop"
+            assert branch == "main"
+            mock_get.assert_not_called()
 
-    def test_get_default_branch_empty_raises(self):
+    def test_get_default_branch_master_fallback(self):
+        fetcher = BitbucketFetcher(token="fake")
+        repo_resp = MagicMock(status_code=200, json=MagicMock(return_value={}))
+        master_resp = MagicMock(status_code=200)
+
+        def fake_get(url, **kwargs):
+            if url.endswith("/refs/branches/master"):
+                return master_resp
+            return repo_resp
+
+        with patch.object(requests, "get", side_effect=fake_get):
+            branch = fetcher.get_default_branch("acme", "myapp")
+            assert branch == "master"
+
+    def test_get_default_branch_unresolved_raises(self):
         fetcher = BitbucketFetcher(token="fake")
         mock_response = MagicMock()
         mock_response.status_code = 404
         mock_response.text = '{"message": "Not found"}'
-        with patch.object(requests, "get", return_value=mock_response), pytest.raises(RuntimeError, match="Bitbucket API error 404"):
+        with patch.object(requests, "get", return_value=mock_response), pytest.raises(
+            RuntimeError, match="Could not resolve default branch"
+        ):
             fetcher.get_default_branch("acme", "myapp")
 
 
