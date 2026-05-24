@@ -2,7 +2,7 @@
 
 from unittest.mock import patch
 
-from agent_graph.graph_builder import _pr_router, build_graph
+from agent_graph.graph_builder import _make_entry_router, _pr_router, build_graph
 from agent_graph.state import TaskState
 
 
@@ -36,6 +36,22 @@ def test_pr_router_failed():
     assert _pr_router(state) == "failed"
 
 
+def test_entry_router_follow_up():
+    router = _make_entry_router("jira")
+    state = {"workflow_mode": "follow_up"}
+    assert router(state) == "plan_adjuster"
+
+
+def test_entry_router_jira_initial():
+    router = _make_entry_router("jira")
+    assert router({"workflow_mode": "initial"}) == "repo_resolver"
+
+
+def test_entry_router_github_initial():
+    router = _make_entry_router("github")
+    assert router({}) == "planner"
+
+
 def test_build_graph_compiles():
     def mock_pr_creator(_state: dict) -> dict:
         return {"pr_url": "https://github.com/o/r/pull/1", "pr_error": ""}
@@ -50,6 +66,7 @@ def test_build_graph_compiles():
     assert graph is not None
     nodes = [k for k in graph.nodes.keys() if not k.startswith("__")]
     assert "planner" in nodes
+    assert "plan_adjuster" in nodes
     assert "executor_loop" in nodes
     assert "pr_aggregator" in nodes
 

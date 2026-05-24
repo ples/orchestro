@@ -12,6 +12,8 @@ WorkflowNodeType = Literal[
 ]
 
 SourcePlatform = Literal["github", "bitbucket", "jira"]
+WorkflowMode = Literal["initial", "follow_up"]
+MAX_FOLLOW_UP_ITERATIONS = 1
 
 
 class RepoRecord(TypedDict, total=False):
@@ -29,6 +31,7 @@ class RepoRecord(TypedDict, total=False):
     deploy_tag_name: str
     deploy_tag_error: str
     repo_summary: str
+    pr_branch: str
 
 
 class TaskState(TypedDict, total=False):
@@ -63,6 +66,9 @@ class TaskState(TypedDict, total=False):
     repo_context: str
     mcp_context: str
     mcp_tools_used: list[str]
+    workflow_mode: WorkflowMode
+    follow_up_prompt: str
+    iteration: int
 
 
 def format_agent_task(issue: str, input_prompt: str = "") -> str:
@@ -76,3 +82,50 @@ def format_agent_task(issue: str, input_prompt: str = "") -> str:
         "## Developer instructions (override ticket scope when they conflict)\n\n"
         f"{prompt}"
     )
+
+
+def format_follow_up_task(
+    issue: str,
+    prior_plan: str,
+    follow_up_prompt: str,
+    diff_summary: str = "",
+) -> str:
+    """Task text for a follow-up adjustment pass."""
+    parts = [issue or "", ""]
+    if (prior_plan or "").strip():
+        parts.extend(
+            [
+                "## Prior implementation plan",
+                "",
+                prior_plan.strip(),
+                "",
+            ]
+        )
+    if (diff_summary or "").strip():
+        parts.extend(
+            [
+                "## Changes already made",
+                "",
+                diff_summary.strip(),
+                "",
+            ]
+        )
+    parts.extend(
+        [
+            "## Adjustment instructions",
+            "",
+            follow_up_prompt.strip(),
+            "",
+            "Modify the existing work to satisfy the adjustment instructions. "
+            "Do not revert unrelated changes unless required.",
+        ]
+    )
+    return "\n".join(parts).strip()
+
+
+def is_follow_up_mode(state: TaskState) -> bool:
+    return state.get("workflow_mode") == "follow_up"
+
+
+def can_run_follow_up(state: TaskState) -> bool:
+    return int(state.get("iteration") or 0) < MAX_FOLLOW_UP_ITERATIONS

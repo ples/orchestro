@@ -108,3 +108,34 @@ def test_prepare_repo_skips_clone_when_existing_path(mock_clone):
     mock_reset.assert_called_once_with("/tmp/existing/repo", "abc")
     assert path == "/tmp/existing/repo"
     assert sha == "abc"
+
+
+@patch("agent_graph.openhands_client.clone_repository")
+def test_prepare_repo_skips_reset_when_disabled(mock_clone):
+    client = OpenHandsClient()
+    with patch("os.path.isdir", return_value=True):
+        with patch("agent_graph.openhands_client.reset_repo_to_baseline") as mock_reset:
+            path, sha = client._prepare_repo(
+                "https://github.com/org/repo.git",
+                existing_repo_path="/tmp/existing/repo",
+                baseline_sha="abc",
+                reset_to_baseline=False,
+            )
+    mock_clone.assert_not_called()
+    mock_reset.assert_not_called()
+    assert path == "/tmp/existing/repo"
+    assert sha == "abc"
+
+
+def test_build_follow_up_prompt():
+    client = OpenHandsClient()
+    prompt = client._build_follow_up_prompt(
+        "Fix UI",
+        "1. Update CSS",
+        "Use blue",
+        "1 file changed",
+        "/workspace/repo",
+    )
+    assert "Adjustment Plan" in prompt
+    assert "Use blue" in prompt
+    assert "do not revert" in prompt.lower() or "Modify the existing" in prompt

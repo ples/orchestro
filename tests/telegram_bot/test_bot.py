@@ -9,6 +9,7 @@ import pytest
 from telegram_bot.bot import (
     TelegramBot,
     WorkflowSession,
+    create_completed_keyboard,
     create_status_keyboard,
     format_task_status_message,
 )
@@ -79,10 +80,19 @@ class TestFormatTaskStatusMessage:
             state={
                 "workflow_node": "completed",
                 "pr_url": "https://github.com/o/r/pull/1",
+                "iteration": 0,
             },
         )
         text, kb = format_task_status_message(session)
         assert "https://github.com/o/r/pull/1" in text
+        assert "adjust" in text.lower()
+        assert kb.inline_keyboard[0][0].callback_data == "adjust"
+
+    def test_completed_keyboard_no_adjust_after_limit(self):
+        kb = create_completed_keyboard(can_adjust=False)
+        labels = [btn.text for row in kb.inline_keyboard for btn in row]
+        assert "Adjust" not in labels
+        assert "Run Again" in labels
 
     def test_completed_with_pr_error(self):
         session = WorkflowSession(

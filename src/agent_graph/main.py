@@ -20,8 +20,10 @@ from agent_graph.agents.planner import PlannerAgent
 from agent_graph.agents.verifier import VerifierAgent
 from agent_graph.cli_output import print_final_result
 from agent_graph.deploy_env import VALID_DEPLOY_ENVS, normalize_deploy_env, resolve_deploy_env
+from agent_graph.agents.plan_adjuster import PlanAdjusterAgent
 from agent_graph.graph_builder import build_graph
-from agent_graph.state import TaskState
+from agent_graph.state import TaskState, can_run_follow_up
+from agent_graph.state_io import load_task_state, save_task_state
 
 
 load_dotenv()
@@ -234,7 +236,32 @@ def cli():
             f"({', '.join(sorted(VALID_DEPLOY_ENVS))}); also DEPLOY_ENV env or prompt"
         ),
     )
+    parser.add_argument(
+        "--follow-up",
+        type=str,
+        default=None,
+        help="Adjustment prompt for a follow-up iteration (requires --state-in)",
+    )
+    parser.add_argument(
+        "--state-in",
+        type=str,
+        default=None,
+        help="Load TaskState JSON from a prior run (for --follow-up)",
+    )
+    parser.add_argument(
+        "--state-out",
+        type=str,
+        default=None,
+        help="Save TaskState JSON after the workflow completes",
+    )
     args = parser.parse_args()
+
+    if args.follow_up and not args.state_in:
+        print("Error: --follow-up requires --state-in from a prior run")
+        sys.exit(1)
+
+    if args.state_in and args.follow_up:
+        return _run_follow_up_cli(args)
 
     if args.deploy_env and normalize_deploy_env(args.deploy_env) is None:
         valid = ", ".join(sorted(VALID_DEPLOY_ENVS))
@@ -511,8 +538,59 @@ def cli():
         "target_repos": target_repos,
     }
 
+    initial_state.setdefault("workflow_mode", "initial")
+    initial_state.setdefault("iteration", 0)
+    initial_state.setdefault("follow_up_prompt", "")
+
     result = app.invoke(initial_state)
     print_final_result(result)
+
+    if args.state_out:
+        save_task_state(args.state_out, result)
+        print(f"State saved to {args.state_out}")
+
+
+def _run_follow_up_cli(args) -> None:
+    try:
+        state = load_task_state(args.state_in)
+    except OSError as e:
+        print(f"Error reading --state-in {args.state_in}: {e}")
+        sys.exit(1)
+
+    if not can_run_follow_up(state):
+        print(
+            "Error: follow-up limit reached (max 1 adjustment per task). "
+            "Start a new workflow."
+        )
+        sys.exit(1)
+
+    follow_up = (args.follow_up or "").strip()
+    if not follow_up:
+        print("Error: --follow-up text must not be empty")
+        sys.exit(1)
+
+    state["follow_up_prompt"] = follow_up
+    state["workflow_mode"] = "follow_up"
+
+    source_platform = state.get("source_platform", "github")
+    planner = PlannerAgent()
+    verifier = VerifierAgent()
+    plan_adjuster = PlanAdjusterAgent()
+
+    app = build_graph(
+        planner_fn=planner.run,
+        verifier_fn=verifier.run,
+        plan_adjuster_fn=plan_adjuster.run,
+        source_platform=source_platform,
+    )
+
+    print(f"Follow-up adjustment: {follow_up[:120]}")
+    result = app.invoke(state)
+    print_final_result(result)
+
+    out_path = args.state_out or args.state_in
+    save_task_state(out_path, result)
+    print(f"State saved to {out_path}")
 
 
 def telegram_cli():
@@ -531,10 +609,12 @@ def telegram_cli():
     def _graph_builder():
         planner = PlannerAgent()
         verifier = VerifierAgent()
+        plan_adjuster = PlanAdjusterAgent()
 
         return build_graph(
             planner_fn=planner.run,
             verifier_fn=verifier.run,
+            plan_adjuster_fn=plan_adjuster.run,
             source_platform="github",
         )
 

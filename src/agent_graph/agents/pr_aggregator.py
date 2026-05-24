@@ -83,6 +83,9 @@ class PrAggregatorAgent(BaseAgent):
                 all_errors.append(f"{target}: {pr_err}")
             tag_name = pr_result.get("deploy_tag_name", "")
             tag_err = pr_result.get("deploy_tag_error", "")
+            pr_branch = pr_result.get("pr_branch", "")
+            if pr_branch:
+                repo_out["pr_branch"] = pr_branch
             if tag_name:
                 repo_out["deploy_tag_name"] = tag_name
                 all_deploy_tags.append(f"{target}: {tag_name}")
@@ -160,7 +163,9 @@ class PrAggregatorAgent(BaseAgent):
         if not owner:
             return {"pr_url": "", "pr_error": "Could not resolve GitHub owner/repo"}
 
-        branch = self._branch_name(state, issue_number, work_repo=work_repo)
+        branch = repo.get("pr_branch") or self._branch_name(
+            state, issue_number, work_repo=work_repo
+        )
         auth_remote = f"https://x-access-token:{token}@github.com/{owner}/{repo_name}.git"
         git_name = os.getenv("GIT_AUTHOR_NAME", "Agent Graph")
         git_email = os.getenv("GIT_AUTHOR_EMAIL", "agent@users.noreply.github.com")
@@ -209,7 +214,7 @@ class PrAggregatorAgent(BaseAgent):
                 return {"pr_url": existing, "pr_error": "", **tag_fields}
             return {"pr_url": "", "pr_error": f"PR API error: {e}", **tag_fields}
 
-        return {"pr_url": pr_url, "pr_error": "", **tag_fields}
+        return {"pr_url": pr_url, "pr_error": "", "pr_branch": branch, **tag_fields}
 
     # -- Bitbucket PR --------------------------------------------------------
 
@@ -225,7 +230,9 @@ class PrAggregatorAgent(BaseAgent):
         if not owner:
             return {"pr_url": "", "pr_error": "Could not resolve Bitbucket owner/repo"}
 
-        branch = self._branch_name(state, None, work_repo=work_repo)
+        branch = repo.get("pr_branch") or self._branch_name(
+            state, None, work_repo=work_repo
+        )
         from agent_graph.repo_clone import BITBUCKET_GIT_USERNAME
 
         auth_remote = (
@@ -271,7 +278,7 @@ class PrAggregatorAgent(BaseAgent):
         except RuntimeError as e:
             return {"pr_url": "", "pr_error": f"PR API error: {e}", **tag_fields}
 
-        return {"pr_url": pr_url, "pr_error": "", **tag_fields}
+        return {"pr_url": pr_url, "pr_error": "", "pr_branch": branch, **tag_fields}
 
     # -- Shared helpers ------------------------------------------------------
 

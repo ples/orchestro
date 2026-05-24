@@ -8,6 +8,7 @@ verification, and automated GitHub pull request creation.
 - [Quick Start](#quick-start)
   - [Step-by-Step](#step-by-step)
   - [Programmatic API](#programmatic-api)
+- [Telegram Bot](#telegram-bot)
 - [Graph Topology](#graph-topology)
 - [Data Model](#data-model)
 - [Agent Architecture](#agent-architecture)
@@ -139,6 +140,69 @@ graph = build_graph(pr_creator_fn=mock_pr_creator)
 result = graph.invoke(state)
 ```
 
+## Telegram Bot
+
+Run the agent workflow from Telegram instead of the CLI. The bot uses long polling and runs the same LangGraph pipeline (plan → execute → verify → PR).
+
+### Prerequisites
+
+Same as [Quick Start](#quick-start): Python 3.12+, virtualenv, `pip install -e .`, a running LLM (`LLM_*` in `.env`), Docker for OpenHands, and tokens for PR creation (`GITHUB_TOKEN` or Bitbucket/Jira settings as needed).
+
+### 1. Create a bot token
+
+1. Open Telegram and message [@BotFather](https://t.me/BotFather).
+2. Send `/newbot`, follow the prompts, and copy the token.
+
+### 2. Configure environment
+
+Copy `.env.example` to `.env` if you have not already, then set at minimum:
+
+
+| Variable                                   | Purpose                                                                  |
+| ------------------------------------------ | ------------------------------------------------------------------------ |
+| `TELEGRAM_BOT_TOKEN`                       | Token from BotFather                                                     |
+| `GITHUB_TOKEN`                             | Push branches and open pull requests                                     |
+| `LLM_MODEL`, `LLM_API_KEY`, `LLM_BASE_URL` | LLM used by planner/executor                                             |
+| `TARGET_REPO_PATH`                         | Default repo (optional when the issue text or Jira ticket implies repos) |
+
+
+For Bitbucket/Jira workflows, also configure `BITBUCKET_TOKEN`, `JIRA_*`, and related vars from `[.env.example](.env.example)`.
+
+### 3. Start the bot server
+
+Activate your virtualenv, then run:
+
+```bash
+agent-graph-telegram
+```
+
+The process stays in the foreground and polls Telegram for messages. Stop it with `Ctrl+C`.
+
+You should see `Telegram bot started in polling mode` in the logs. If `TELEGRAM_BOT_TOKEN` is missing, the command exits with setup instructions.
+
+### 4. Use in Telegram Messenger
+
+1. Open your bot in Telegram (use the link from BotFather or search by username).
+2. Send `/start` — the bot replies: *Ready! Send me an issue to work on.*
+3. Send a task as a plain-text message, for example:
+  - `Add JWT authentication to FastAPI backend`
+  - `https://company.atlassian.net/browse/MINSKY-123`
+4. The bot updates one status message as the workflow progresses: **Planning** → **Executing** → **Verifying** → **Creating pull request**.
+5. When finished, you get the PR link, a skip reason, or an error message.
+
+**Inline buttons**
+
+
+| Button        | When                   | Action                            |
+| ------------- | ---------------------- | --------------------------------- |
+| **Start**     | Idle                   | Prompts you to send a task        |
+| **Run Again** | During or after a run  | Clears the session for a new task |
+| **Adjust**    | After a successful run | Asks for adjustment instructions  |
+| **Retry**     | After an error         | Re-runs the workflow              |
+
+
+**Follow-up adjustments:** After completion, send another message with changes (e.g. `Use a blue button; add a unit test`) or tap **Adjust**. One adjustment pass is allowed per task; it reuses the existing branch and updates the PR. See [Follow-up adjustment](#follow-up-adjustment-one-iteration).
+
 ## Graph Topology
 
 The workflow is a directed state machine that ends after PR creation (or skip when there are no changes).
@@ -147,15 +211,37 @@ For Jira/Bitbucket issues, `repo_resolver` runs first to detect target repositor
 ```mermaid
 flowchart LR
     RR["repo_resolver"] --> P["planner"]
-    P --> E["executor_loop"]
+    PA["plan_adjuster"] --> E["executor_loop"]
+    P --> E
     E --> V["verifier"]
     V --> PR["pr_aggregator"]
     PR --> DONE["end"]
 ```
 
+
+
+Entry routing: `follow_up` mode skips planner/repo_resolver and starts at `plan_adjuster`.
+
 **Planner phase:** clones each detected repo, runs a static dependency scan, then OpenHands in Docker (read-only analysis) to produce per-repo `repo_summary` and an aggregated `plan`.
 
 **Executor phase:** reuses planner clones (`planner_clone_path`), resets git to baseline, then OpenHands implements the plan per repository.
+
+### Follow-up adjustment (one iteration)
+
+After a completed run, you can request **one** adjustment pass that modifies existing work instead of starting over:
+
+- Reuses `work_repo_path` and does not reset to baseline
+- Skips full planner; `plan_adjuster` merges prior plan, diff, and your adjustment prompt
+- Pushes to the same branch / updates the existing PR
+
+**CLI:**
+
+```bash
+python -m agent_graph.main --issue "..." --state-out run.json
+python -m agent_graph.main --state-in run.json --follow-up "Use blue button; add a unit test"
+```
+
+**Telegram:** when a workflow is completed, send a message with adjustment instructions or tap **Adjust**. See [Telegram Bot](#telegram-bot).
 
 ## Data Model
 
@@ -173,6 +259,8 @@ classDiagram
         +str work_repo_path
     }
 ```
+
+
 
 - `issue` — original task description.
 - `plan` — aggregated implementation plan from the planner (includes per-repo OpenHands analysis).
@@ -200,6 +288,8 @@ classDiagram
         +str details
     }
 ```
+
+
 
 ## Agent Architecture
 
@@ -241,6 +331,8 @@ classDiagram
     BaseAgent <|-- PrCreatorAgent
 ```
 
+
+
 Factory functions live in `graph_builder.py`. The `build_graph()` function accepts optional
 callback overrides so you can swap in mock or production agents without changing the graph itself.
 
@@ -271,13 +363,15 @@ classDiagram
     AgentError <|-- PrCreationError
 ```
 
+
+
 ## MCP Integration
 
 The agent graph can use [Model Context Protocol](https://modelcontextprotocol.io/) servers for documentation lookup, Jira ingest, and (optionally) OpenHands executor tools.
 
 ### Configuration
 
-- Project config: [`mcp.config.json`](mcp.config.json) — enable servers and set `transport` (`stdio` or `http`)
+- Project config: `[mcp.config.json](mcp.config.json)` — enable servers and set `transport` (`stdio` or `http`)
 - Secrets: `.env` only (e.g. `CONTEXT7_API_KEY`, `JIRA_CLOUD_ID`)
 - Optional merge from Cursor: `MCP_USE_CURSOR_CONFIG=1` reads `~/.cursor/mcp.json` (project entries override)
 
@@ -303,22 +397,25 @@ Set `OPENHANDS_MCP_ENABLED=1` to pass MCP servers into the OpenHands `Agent` ins
 
 ## Tech Stack
 
-| Layer             | Technology   | Purpose               |
-|-------------------|------------- |-----------------------|
-| Workflow engine   | LangGraph    | State-machine runner  |
-| Schema validation | Pydantic     | Runtime type checks   |
-| State definition  | `TypedDict`  | Lightweight interface |
-| Linting           | Ruff         | Fast Python linter    |
-| Static analysis   | mypy         | Type checking         |
-| Testing           | pytest       | Unit & integration    |
+
+| Layer             | Technology  | Purpose               |
+| ----------------- | ----------- | --------------------- |
+| Workflow engine   | LangGraph   | State-machine runner  |
+| Schema validation | Pydantic    | Runtime type checks   |
+| State definition  | `TypedDict` | Lightweight interface |
+| Linting           | Ruff        | Fast Python linter    |
+| Static analysis   | mypy        | Type checking         |
+| Testing           | pytest      | Unit & integration    |
+
 
 ## Requirements
 
 - Python >= 3.11
-- See `[project]` dependencies in [`pyproject.toml`](pyproject.toml) for the full list.
+- See `[project]` dependencies in `[pyproject.toml](pyproject.toml)` for the full list.
 
 To install dev tooling in one step:
 
 ```bash
 pip install -e ".[dev]"
 ```
+

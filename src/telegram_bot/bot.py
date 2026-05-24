@@ -17,7 +17,7 @@ from aiogram.types import (
     Message,
 )
 
-from agent_graph.state import TaskState
+from agent_graph.state import TaskState, can_run_follow_up
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,9 @@ def _empty_task_state(chat_id: int | str) -> TaskState:
         "target_repos": [],
         "chat_id": str(chat_id),
         "workflow_node": "idle",
+        "workflow_mode": "initial",
+        "follow_up_prompt": "",
+        "iteration": 0,
     }
 
 
@@ -63,6 +66,14 @@ def create_status_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Run Again", callback_data="run_again")],
         ]
     )
+
+
+def create_completed_keyboard(can_adjust: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if can_adjust:
+        rows.append([InlineKeyboardButton(text="Adjust", callback_data="adjust")])
+    rows.append([InlineKeyboardButton(text="Run Again", callback_data="run_again")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def format_task_status_message(session: WorkflowSession) -> tuple[str, InlineKeyboardMarkup]:
@@ -96,15 +107,19 @@ def format_task_status_message(session: WorkflowSession) -> tuple[str, InlineKey
         pr_url = state.get("pr_url", "")
         pr_error = state.get("pr_error", "")
         skip = state.get("pr_skip_reason", "")
+        adjust_hint = ""
+        if can_run_follow_up(state):
+            adjust_hint = "\n\nSend a message to adjust the result, or tap Adjust."
+        kb = create_completed_keyboard(can_run_follow_up(state))
         if pr_url:
-            return f"Workflow completed.\n\nPull request:\n{pr_url}", create_status_keyboard()
+            return f"Workflow completed.\n\nPull request:\n{pr_url}{adjust_hint}", kb
         if pr_error:
-            return f"Workflow finished with PR error:\n{pr_error}", create_status_keyboard()
+            return f"Workflow finished with PR error:\n{pr_error}{adjust_hint}", kb
         if skip:
-            return f"Workflow completed.\n\nPR skipped:\n{skip}", create_status_keyboard()
+            return f"Workflow completed.\n\nPR skipped:\n{skip}{adjust_hint}", kb
         return (
-            "Workflow completed (no PR — no changes detected).",
-            create_status_keyboard(),
+            f"Workflow completed (no PR — no changes detected).{adjust_hint}",
+            kb,
         )
 
     if node == "error":
@@ -184,11 +199,24 @@ class TelegramBot:
                 )
 
             session = self._sessions[chat_id]
+            is_follow_up = False
             async with session.state_lock:
-                session.state["issue"] = issue_text
-                session.state["workflow_node"] = "planning"
+                node = session.state.get("workflow_node", "idle")
+                if node == "completed" and can_run_follow_up(session.state):
+                    session.state["follow_up_prompt"] = issue_text
+                    session.state["workflow_mode"] = "follow_up"
+                    session.state["workflow_node"] = "planning"
+                    is_follow_up = True
+                else:
+                    session.state["issue"] = issue_text
+                    session.state["workflow_mode"] = "initial"
+                    session.state["follow_up_prompt"] = ""
+                    session.state["iteration"] = 0
+                    session.state["workflow_node"] = "planning"
 
             text, kb = format_task_status_message(session)
+            if is_follow_up:
+                text = f"Applying adjustment...\n\n{issue_text[:200]}"
             send_msg = await message.answer(text, reply_markup=kb)
             session.current_message_ids["task"] = send_msg.message_id
 
@@ -201,19 +229,30 @@ class TelegramBot:
                     session.state["error_message"] = str(e)
                 await self._notify_chat(session, session.chat_id)
 
-        @self._router.callback_query(F.data.in_(["run_again", "start", "retry"]))
+        @self._router.callback_query(
+            F.data.in_(["run_again", "start", "retry", "adjust"])
+        )
         async def handle_callback(callback_query: CallbackQuery) -> None:
             data = callback_query.data
-            user_id = callback_query.from_user.id
+            chat_id = callback_query.message.chat.id
 
-            if user_id not in self._sessions:
+            if chat_id not in self._sessions:
                 await callback_query.answer("No active session. Send /start first.")
                 return
 
-            session = self._sessions[user_id]
+            session = self._sessions[chat_id]
 
             if data in ("run_again", "start"):
                 await self._handle_new_task(callback_query, session)
+            elif data == "adjust":
+                if not can_run_follow_up(session.state):
+                    await callback_query.answer(
+                        "Follow-up limit reached. Tap Run Again for a new task."
+                    )
+                    return
+                await callback_query.message.answer(
+                    "Send your adjustment instructions as a message."
+                )
             elif data == "retry":
                 await self._run_workflow(session)
 
@@ -249,6 +288,7 @@ class TelegramBot:
 
         async with session.state_lock:
             session.state.update(result)
+            session.state["workflow_node"] = "completed"
 
         await self._notify_chat(session, session.chat_id)
 
@@ -291,7 +331,6 @@ class TelegramBot:
         """Start the bot in polling mode."""
         logger.info("Telegram bot started in polling mode")
         self._setup_handlers()
-        self.dp.include_routers(self._router)
 
         bot = self.bot
 

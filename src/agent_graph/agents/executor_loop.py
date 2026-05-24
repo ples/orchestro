@@ -5,7 +5,7 @@ import os
 from agent_graph.exceptions import ExecutorError
 from agent_graph.logging_config import step, verbose_print
 from agent_graph.pr_skip import NO_CHANGES_SKIP
-from agent_graph.state import RepoRecord, TaskState
+from agent_graph.state import RepoRecord, TaskState, is_follow_up_mode
 
 from .base import BaseAgent
 
@@ -20,12 +20,15 @@ class ExecutorLoopAgent(BaseAgent):
         plan = state.get("plan", "")
         issue = state.get("issue", "")
         input_prompt = state.get("input_prompt", "")
+        follow_up = is_follow_up_mode(state)
+        follow_up_prompt = (state.get("follow_up_prompt") or "").strip()
 
         if not target_repos:
             step("\n[Executor Loop] no repos — running without target repo")
             return _fallback_single(state)
 
-        step(f"\n[Executor Loop] {len(target_repos)} repository(ies)")
+        label = "follow-up" if follow_up else "initial"
+        step(f"\n[Executor Loop] {len(target_repos)} repository(ies) ({label})")
 
         repos_dot = _extract_repos_dot(plan, target_repos)
 
@@ -46,9 +49,9 @@ class ExecutorLoopAgent(BaseAgent):
         if reuse_agent_server() and not runtime_err and len(target_repos) > 1:
             mounts = []
             for repo_record in target_repos:
-                clone_path = repo_record.get("planner_clone_path", "")
-                if clone_path and os.path.isdir(clone_path):
-                    mounts.append((clone_path, os.path.basename(clone_path)))
+                path = _repo_work_path(repo_record, follow_up=follow_up)
+                if path and os.path.isdir(path):
+                    mounts.append((path, os.path.basename(path)))
             if mounts:
                 session = AgentServerSession(
                     client, mounts, skip_health_checks=skip_health_checks
@@ -80,10 +83,10 @@ class ExecutorLoopAgent(BaseAgent):
                     step(f"    skipped: {runtime_err}")
                     continue
 
-                clone_path = repo_record.get("planner_clone_path", "")
+                work_path = _repo_work_path(repo_record, follow_up=follow_up)
                 baseline = repo_record.get("repo_baseline_sha", "")
-                if clone_path:
-                    verbose_print(f"    reusing planner clone: {clone_path}")
+                if work_path:
+                    verbose_print(f"    using work tree: {work_path}")
 
                 sub_plan = (
                     f"{plan}\n\n## Repo-specific sub-task\n\n{summary}"
@@ -99,11 +102,13 @@ class ExecutorLoopAgent(BaseAgent):
                         plan=sub_plan,
                         repo_record=repo_record,
                         repos_dot=repos_dot,
-                        existing_repo_path=clone_path or None,
+                        existing_repo_path=work_path or None,
                         baseline_sha=baseline or None,
                         skip_health_checks=skip_health_checks,
                         session=session,
                         client=client,
+                        follow_up=follow_up,
+                        follow_up_prompt=follow_up_prompt,
                     )
                     updated_repos.append(result)
                     err = result.get("pr_error", "")
@@ -128,7 +133,21 @@ class ExecutorLoopAgent(BaseAgent):
         if all_errors:
             step(f"  [Executor Loop] {len(all_errors)} repo(s) had errors")
 
-        return {"target_repos": updated_repos}
+        out: dict = {"target_repos": updated_repos}
+        if follow_up:
+            out["iteration"] = 1
+            out["follow_up_prompt"] = ""
+            out["workflow_mode"] = "initial"
+        return out
+
+
+def _repo_work_path(repo_record: RepoRecord, *, follow_up: bool) -> str:
+    if follow_up:
+        return (
+            repo_record.get("work_repo_path", "")
+            or repo_record.get("planner_clone_path", "")
+        )
+    return repo_record.get("planner_clone_path", "")
 
 
 def _run_single(
@@ -143,6 +162,9 @@ def _run_single(
     skip_health_checks: bool = False,
     session=None,
     client=None,
+    *,
+    follow_up: bool = False,
+    follow_up_prompt: str = "",
 ) -> RepoRecord:
     from agent_graph.openhands_client import OpenHandsClient
 
@@ -159,6 +181,7 @@ def _run_single(
         summary = f"\n\nApply changes to this repository: {target_repo}"
 
     full_plan = plan + summary
+    diff_stat = repo_record.get("change_stat", "") if follow_up else ""
     result = client.run_task(
         target_repo=target_repo,
         issue=issue,
@@ -168,6 +191,9 @@ def _run_single(
         skip_health_checks=skip_health_checks,
         input_prompt=input_prompt,
         session=session,
+        follow_up=follow_up,
+        follow_up_prompt=follow_up_prompt,
+        diff_stat=diff_stat,
     )
 
     updated = dict(repo_record)
@@ -191,13 +217,22 @@ def _run_single(
 
 
 def _fallback_single(state: TaskState) -> dict:
-    return _run_single(
-        target_repo=state.get("target_repo_path", "") or state.get("github_issue_url", "") or "",
-        issue=state.get("issue", ""),
-        input_prompt=state.get("input_prompt", ""),
-        plan=state.get("plan", ""),
-        repo_record={},
-    )
+    follow_up = is_follow_up_mode(state)
+    return {
+        "target_repos": [
+            _run_single(
+                target_repo=state.get("target_repo_path", "")
+                or state.get("github_issue_url", "")
+                or "",
+                issue=state.get("issue", ""),
+                input_prompt=state.get("input_prompt", ""),
+                plan=state.get("plan", ""),
+                repo_record={},
+                follow_up=follow_up,
+                follow_up_prompt=(state.get("follow_up_prompt") or "").strip(),
+            )
+        ]
+    }
 
 
 def _extract_repos_dot(plan: str, target_repos: list[RepoRecord]) -> str:

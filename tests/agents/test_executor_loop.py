@@ -2,7 +2,11 @@
 
 from unittest.mock import MagicMock, patch
 
-from agent_graph.agents.executor_loop import ExecutorLoopAgent, _run_single
+from agent_graph.agents.executor_loop import (
+    ExecutorLoopAgent,
+    _repo_work_path,
+    _run_single,
+)
 from agent_graph.models import ExecutionResult
 from agent_graph.state import TaskState
 
@@ -121,3 +125,39 @@ def test_executor_skips_when_runtime_unavailable(mock_run_single, _mock_health):
     result = ExecutorLoopAgent().run(state)
     mock_run_single.assert_not_called()
     assert "Docker down" in result["target_repos"][0].get("pr_error", "")
+
+
+def test_repo_work_path_follow_up_prefers_work_tree():
+    record = {
+        "work_repo_path": "/tmp/work",
+        "planner_clone_path": "/tmp/planner",
+    }
+    assert _repo_work_path(record, follow_up=True) == "/tmp/work"
+    assert _repo_work_path(record, follow_up=False) == "/tmp/planner"
+
+
+@patch("agent_graph.openhands_client.OpenHandsClient.check_runtime_ready", return_value=None)
+@patch("agent_graph.agents.executor_loop._run_single")
+def test_executor_loop_follow_up_uses_work_path(mock_run_single, _mock_health):
+    mock_run_single.return_value = {
+        "target_repo_path": "https://github.com/o/r.git",
+        "work_repo_path": "/tmp/work",
+    }
+    state = _make_state(
+        workflow_mode="follow_up",
+        follow_up_prompt="Make button blue",
+        target_repos=[
+            {
+                "target_repo_path": "https://github.com/o/r.git",
+                "planner_clone_path": "/tmp/planner",
+                "work_repo_path": "/tmp/work",
+                "repo_baseline_sha": "sha1",
+            }
+        ],
+    )
+    result = ExecutorLoopAgent().run(state)
+    call_kw = mock_run_single.call_args[1]
+    assert call_kw["existing_repo_path"] == "/tmp/work"
+    assert call_kw["follow_up"] is True
+    assert call_kw["follow_up_prompt"] == "Make button blue"
+    assert result.get("iteration") == 1

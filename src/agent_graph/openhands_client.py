@@ -148,11 +148,12 @@ class OpenHandsClient:
         existing_repo_path: str | None = None,
         baseline_sha: str | None = None,
         clone_prefix: str = "openhands_repo_",
+        reset_to_baseline: bool = True,
     ) -> tuple[str, str]:
         if existing_repo_path and os.path.isdir(existing_repo_path):
             repo_path = existing_repo_path
             base = baseline_sha or ""
-            if base:
+            if base and reset_to_baseline:
                 reset_repo_to_baseline(repo_path, base)
             return repo_path, base
 
@@ -287,12 +288,17 @@ class OpenHandsClient:
         skip_health_checks: bool = False,
         input_prompt: str = "",
         session: AgentServerSession | None = None,
+        *,
+        follow_up: bool = False,
+        follow_up_prompt: str = "",
+        diff_stat: str = "",
     ) -> ExecutionResult:
         try:
             repo_path, base = self._prepare_repo(
                 target_repo,
                 existing_repo_path=existing_repo_path,
                 baseline_sha=baseline_sha,
+                reset_to_baseline=not follow_up,
             )
         except ExecutorError as exc:
             return ExecutionResult(success=False, summary=str(exc))
@@ -300,7 +306,17 @@ class OpenHandsClient:
         workspace_dir = (
             f"/workspace/{os.path.basename(repo_path)}" if repo_path else "/workspace"
         )
-        prompt = self._build_prompt(issue, plan, workspace_dir, input_prompt=input_prompt)
+        if follow_up:
+            prompt = self._build_follow_up_prompt(
+                issue,
+                plan,
+                follow_up_prompt,
+                diff_stat,
+                workspace_dir,
+                input_prompt=input_prompt,
+            )
+        else:
+            prompt = self._build_prompt(issue, plan, workspace_dir, input_prompt=input_prompt)
 
         try:
             return self._execute_in_docker_workspace(
@@ -486,6 +502,46 @@ class OpenHandsClient:
             f"{numbered}\n\n"
             f"Confirm the repository exists, implement the changes, and show me "
             f"the `git diff` output."
+        )
+
+    def _build_follow_up_prompt(
+        self,
+        issue: str,
+        plan: str,
+        follow_up_prompt: str,
+        diff_stat: str,
+        workspace_dir: str,
+        *,
+        input_prompt: str = "",
+    ) -> str:
+        from agent_graph.state import format_follow_up_task
+
+        diff_summary = diff_stat.strip()
+        task = format_follow_up_task(issue, "", follow_up_prompt, diff_summary)
+        if (input_prompt or "").strip():
+            task = self._format_task_for_prompt(task, input_prompt)
+        if workspace_dir != "/workspace":
+            repo_instruction = f"Work in the repository at: {workspace_dir}"
+        else:
+            repo_instruction = (
+                "Continue in the existing work tree. "
+                "Do not clone a fresh copy or reset to baseline."
+            )
+        steps = [
+            repo_instruction,
+            "Modify the existing implementation; do not revert unrelated changes",
+            "Follow the adjustment plan below",
+            "Make all modifications inside the repository directory",
+            "When finished, run `git diff` and include the output in your final message",
+            "Provide a brief summary of what was changed",
+        ]
+        numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+        return (
+            f"# Task\n\n{task}\n\n"
+            f"# Adjustment Plan\n\n{plan}\n\n"
+            f"# Instructions\n\n"
+            f"{numbered}\n\n"
+            f"Apply the adjustments on top of the current work tree and show `git diff`."
         )
 
     @staticmethod
