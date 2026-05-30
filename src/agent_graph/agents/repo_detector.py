@@ -359,6 +359,7 @@ class RepoDetectorAgent(BaseAgent):
 
         records: list[RepoRecord] = []
         seen_urls: set[str] = set()
+        unresolved_services: list[tuple[str, str]] = []
 
         for ent in entities:
             if ent.kind == "repo":
@@ -412,17 +413,119 @@ class RepoDetectorAgent(BaseAgent):
                         print(
                             f"  [Repo Detector] Resolved service '{service_name}' -> {url}"
                         )
+                    else:
+                        unresolved_services.append((service_name, platform))
 
         if not records:
-            records = self._ask_for_repos(issue, seen_urls)
+            records = self._detect_via_llm(
+                detect_text=detect_text,
+                input_prompt=state.get("input_prompt", ""),
+                source_platform=platforms[0],
+                seen_urls=seen_urls,
+            )
+
+        if not records:
+            print("  [Repo Detector] No target repositories could be successfully detected or resolved.")
+            if unresolved_services:
+                print("  [Repo Detector] Details: Attempted to resolve the following services from text keywords but failed:")
+                for service_name, platform in unresolved_services:
+                    print(f"    - Service name: '{service_name}' (Target Platform: {platform})")
+                    if platform == "github":
+                        gh_owner = os.getenv("GH_DEFAULT_OWNER", "").strip()
+                        if not gh_owner:
+                            print(
+                                "      Cause: source_platform is 'github' but GH_DEFAULT_OWNER is not set in the environment (.env).\n"
+                                "             Please configure GH_DEFAULT_OWNER=your_github_org_or_user in your environment."
+                            )
+                        else:
+                            print(
+                                f"      Cause: Checked repository 'https://github.com/{gh_owner}/{service_name}.git' "
+                                f"but it did not exist, or you lack read permissions."
+                            )
+                    elif platform in ("jira", "bitbucket"):
+                        bb_owner = os.getenv("BB_DEFAULT_OWNER", "").strip()
+                        bb_token = os.getenv("BITBUCKET_TOKEN", "").strip()
+                        if not bb_owner:
+                            print(
+                                "      Cause: Target platform is 'bitbucket'/'jira' but BB_DEFAULT_OWNER is not set in the environment (.env).\n"
+                                "             Please configure BB_DEFAULT_OWNER=your_bitbucket_workspace in your environment."
+                            )
+                        elif not bb_token:
+                            print(
+                                "      Cause: BITBUCKET_TOKEN is not set in the environment (.env).\n"
+                                "             Please configure BITBUCKET_TOKEN=your_app_password_or_token in your environment."
+                            )
+                        else:
+                            print(
+                                f"      Cause: Could not find a repository matching slug '{service_name}' in Bitbucket "
+                                f"workspace '{bb_owner}'. Checked Bitbucket Catalog API and found no match."
+                            )
+            else:
+                print("  [Repo Detector] Cause: No repository URLs, organizations, or service keywords (e.g. 'admin ui', 'auth') were found in the issue text.")
+            
+            records = self._ask_for_repos(state, seen_urls)
 
         if records:
             return {"target_repos": records}
         return {"target_repos": state.get("target_repos", [])}
 
     @staticmethod
-    def _ask_for_repos(issue_text: str, seen_urls: set[str]) -> list[RepoRecord]:
+    def _detect_via_llm(
+        *,
+        detect_text: str,
+        input_prompt: str,
+        source_platform: str,
+        seen_urls: set[str],
+    ) -> list[RepoRecord]:
+        from agent_graph.repo_llm_extractor import (
+            catalog_entries_to_records,
+            extract_target_repo_slugs,
+            list_workspace_catalog,
+            llm_repo_detect_enabled,
+        )
+
+        if not llm_repo_detect_enabled():
+            return []
+
+        catalog = list_workspace_catalog(source_platform)
+        if not catalog:
+            print(
+                "  [Repo Detector] LLM repo detection skipped: "
+                "workspace catalog unavailable (BB_DEFAULT_OWNER+BITBUCKET_TOKEN or GH_DEFAULT_OWNER)"
+            )
+            return []
+
+        print(
+            f"  [Repo Detector] LLM selecting repos from catalog ({len(catalog)} repos)..."
+        )
+        slugs, reason = extract_target_repo_slugs(
+            detect_text,
+            input_prompt,
+            catalog,
+        )
+        if not slugs:
+            if reason:
+                print(f"  [Repo Detector] LLM found no matching repos: {reason}")
+            return []
+
+        records = catalog_entries_to_records(slugs, catalog)
+        out: list[RepoRecord] = []
+        for record in records:
+            url = record.get("target_repo_path", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                out.append(record)
+                print(f"  [Repo Detector] LLM selected repo: {url}")
+        return out
+
+    @staticmethod
+    def _ask_for_repos(state: TaskState, seen_urls: set[str]) -> list[RepoRecord]:
         import sys as _sys
+
+        # Bypass interactive stdin prompts when running inside Telegram bot mode
+        if state.get("chat_id"):
+            return []
+
         try:
             _can_read = _sys.stdin.isatty()
             _can_read = _can_read and _sys.stdin.fileno() >= 0

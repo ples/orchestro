@@ -75,6 +75,33 @@ def has_changes_since(repo_path: str, baseline_sha: str) -> bool:
     return bool(capture_diff_since(repo_path, "").strip())
 
 
+def apply_unified_patch(repo_path: str, patch_text: str) -> tuple[bool, str]:
+    """Apply a unified diff in the repo work tree."""
+    if not repo_path or not (patch_text or "").strip():
+        return False, "empty patch"
+    result = subprocess.run(
+        ["git", "-C", repo_path, "apply", "--whitespace=fix"],
+        input=patch_text,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return True, ""
+    return False, (result.stderr or result.stdout or "git apply failed").strip()
+
+
+def changed_files_since(repo_path: str, baseline_sha: str) -> list[str]:
+    if not repo_path:
+        return []
+    args = ["git", "-C", repo_path, "diff", "--name-only"]
+    if baseline_sha:
+        args.append(baseline_sha)
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
 def change_summary(repo_path: str, baseline_sha: str) -> dict[str, str | int]:
     """Diagnostic summary for logging and skip reasons."""
     uncommitted = has_uncommitted_changes(repo_path)

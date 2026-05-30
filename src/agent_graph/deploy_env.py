@@ -14,6 +14,7 @@ _PARSE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"(?i)deploy-env:\s*(\w+)"),
     re.compile(r"(?i)deploy_env\s*=\s*(\w+)"),
     re.compile(r"(?i)(?:deploy|release)\s+(?:to|for)\s+(\w+)"),
+    re.compile(r"(?i)\bdeploy\s+(\w+)\b"),
     re.compile(r"(?i)tag-env\s+ENV=(\w+)"),
     re.compile(r"(?im)^ENV=(\w+)\s*$"),
     re.compile(r"(?i)(?:tag|env)[- ](?:for|to)\s+(\w+)"),
@@ -61,6 +62,30 @@ def resolve_deploy_env(
         return from_env
     combined = "\n\n".join(p for p in (issue, input_prompt) if p and p.strip())
     return parse_deploy_env_from_text(combined)
+
+
+def resolve_deploy_env_with_source(
+    *,
+    cli: str | None = None,
+    issue: str = "",
+    input_prompt: str = "",
+    env_var: str | None = None,
+) -> tuple[str | None, str]:
+    """Resolve deploy env and return (value, source)."""
+    from_cli = normalize_deploy_env(cli)
+    if from_cli:
+        return from_cli, "cli"
+
+    from_env = normalize_deploy_env(env_var)
+    if from_env:
+        return from_env, "env"
+
+    combined = "\n\n".join(p for p in (issue, input_prompt) if p and p.strip())
+    from_text = parse_deploy_env_from_text(combined)
+    if from_text:
+        return from_text, "prompt/issue"
+
+    return None, ""
 
 
 def _git(repo_path: str, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

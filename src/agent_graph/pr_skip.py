@@ -1,6 +1,7 @@
 """Shared helpers for PR skip vs failure."""
 
 NO_CHANGES_SKIP = "no_changes"
+REQUIRED_CHANGES_MISSING = "required_changes_missing"
 
 
 def is_no_changes_summary(text: str) -> bool:

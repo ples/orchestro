@@ -30,3 +30,7 @@ node_modules/
 # openhands workspace
 workspace/
 .openhands/
+
+# local run database
+data/
+*.db

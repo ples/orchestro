@@ -19,14 +19,23 @@ from agent_graph.agents.jira_mcp_fetcher import McpJiraFetcher
 from agent_graph.agents.planner import PlannerAgent
 from agent_graph.agents.verifier import VerifierAgent
 from agent_graph.cli_output import print_final_result
-from agent_graph.deploy_env import VALID_DEPLOY_ENVS, normalize_deploy_env, resolve_deploy_env
+from agent_graph.deploy_env import (
+    VALID_DEPLOY_ENVS,
+    normalize_deploy_env,
+    resolve_deploy_env_with_source,
+)
 from agent_graph.agents.plan_adjuster import PlanAdjusterAgent
 from agent_graph.graph_builder import build_graph
+from agent_graph.database import get_db, new_run_id
 from agent_graph.state import TaskState, can_run_follow_up
 from agent_graph.state_io import load_task_state, save_task_state
 
 
 load_dotenv()
+
+def _graph_config(run_id: str) -> dict:
+    return {"configurable": {"thread_id": run_id}}
+
 
 # URL detection patterns for auto-classification of --issue input
 _JIRA_URL_PATTERN = re.compile(
@@ -254,7 +263,32 @@ def cli():
         default=None,
         help="Save TaskState JSON after the workflow completes",
     )
+    parser.add_argument(
+        "--list-runs",
+        action="store_true",
+        help="List recent workflow runs saved in the local SQLite database",
+    )
+    parser.add_argument(
+        "--ask-run",
+        type=str,
+        default=None,
+        metavar="RUN_ID",
+        help="Show details or ask questions about a past run (use with --question)",
+    )
+    parser.add_argument(
+        "--question",
+        type=str,
+        default=None,
+        help="Question about a past run (requires --ask-run)",
+    )
     args = parser.parse_args()
+    if args.list_runs:
+        asyncio.run(_cli_list_runs())
+        return
+
+    if args.ask_run:
+        asyncio.run(_cli_ask_run(args.ask_run, args.question))
+        return
 
     if args.follow_up and not args.state_in:
         print("Error: --follow-up requires --state-in from a prior run")
@@ -274,6 +308,7 @@ def cli():
         suffix = "..." if len(input_prompt) > 120 else ""
         print(f"Developer instructions: {preview}{suffix}")
 
+    raw_issue_text = args.issue
     issue_text = args.issue
     github_url = ""
     bitbucket_url = ""
@@ -297,6 +332,14 @@ def cli():
         try:
             issue_text, jira_url = _fetch_jira_issue_by_key(
                 jira_issue_key, use_mcp=use_mcp
+            )
+            input_prompt = "\n\n".join(
+                p
+                for p in (
+                    input_prompt,
+                    f"[User Context]: {raw_issue_text}",
+                )
+                if p and p.strip()
             )
         except Exception as e:
             print(f"Error fetching Jira issue {jira_issue_key}: {e}")
@@ -499,27 +542,28 @@ def cli():
 
     target_repos = _build_target_repos(cli_repos)
 
-    deploy_env = resolve_deploy_env(
+    deploy_env, deploy_env_source = resolve_deploy_env_with_source(
         cli=args.deploy_env,
         issue=issue_text,
         input_prompt=input_prompt,
         env_var=os.getenv("DEPLOY_ENV"),
     )
     if deploy_env:
-        if args.deploy_env:
-            source = "CLI"
-        elif os.getenv("DEPLOY_ENV", "").strip():
-            source = "DEPLOY_ENV"
-        else:
-            source = "prompt/issue"
+        source = (
+            "CLI"
+            if deploy_env_source == "cli"
+            else "DEPLOY_ENV" if deploy_env_source == "env" else "prompt/issue"
+        )
         print(f"Deploy environment: {deploy_env} (from {source})")
 
     initial_state: TaskState = {
         "issue": issue_text,
         "input_prompt": input_prompt,
         "deploy_env": deploy_env or "",
+        "deploy_env_source": deploy_env_source,
         "deploy_tag_name": "",
         "deploy_tag_error": "",
+        "pr_push_mode": "",
         "plan": "",
         "implementation_result": "",
         "verification_result": "",
@@ -542,12 +586,74 @@ def cli():
     initial_state.setdefault("iteration", 0)
     initial_state.setdefault("follow_up_prompt", "")
 
-    result = app.invoke(initial_state)
+    run_id = new_run_id()
+    initial_state["run_id"] = run_id
+    asyncio.run(_persist_cli_run(run_id, initial_state))
+
+    result = app.invoke(initial_state, config=_graph_config(run_id))
+    result["run_id"] = run_id
+    asyncio.run(_persist_cli_run(run_id, result))
     print_final_result(result)
+    print(f"Run saved: {run_id}")
 
     if args.state_out:
         save_task_state(args.state_out, result)
         print(f"State saved to {args.state_out}")
+
+
+async def _persist_cli_run(run_id: str, state: TaskState) -> None:
+    db = get_db()
+    await db.init()
+    await db.save_run(run_id, "cli", state)
+
+
+async def _cli_list_runs(limit: int = 20) -> None:
+    db = get_db()
+    await db.init()
+    runs = await db.list_runs(limit=limit)
+    if not runs:
+        print("No runs found.")
+        return
+    for run in runs:
+        issue_preview = (run.get("issue") or "")[:80].replace("\n", " ")
+        print(
+            f"{run['run_id']}  [{run.get('chat_id', '')}]  "
+            f"{run.get('workflow_node', '')}  {run.get('updated_at', '')}"
+        )
+        print(f"  {issue_preview}")
+        if run.get("pr_url"):
+            print(f"  PR: {run['pr_url'][:120]}")
+        print()
+
+
+async def _cli_ask_run(run_id: str, question: str | None) -> None:
+    db = get_db()
+    await db.init()
+    run = await db.get_run(run_id)
+    if not run:
+        print(f"Error: run not found: {run_id}")
+        sys.exit(1)
+
+    if not question:
+        print(f"Run: {run_id}")
+        print(f"Chat: {run.get('chat_id', '')}")
+        print(f"Status: {run.get('workflow_node', '')}")
+        print(f"Created: {run.get('created_at', '')}")
+        issue = (run.get("issue") or "")[:500]
+        if issue:
+            print(f"\nIssue:\n{issue}")
+        if run.get("pr_url"):
+            print(f"\nPR: {run['pr_url']}")
+        try:
+            question = input("\nQuestion: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not question:
+            return
+
+    answer = await db.ask_question(run, question)
+    print(answer)
 
 
 def _run_follow_up_cli(args) -> None:
@@ -585,8 +691,15 @@ def _run_follow_up_cli(args) -> None:
     )
 
     print(f"Follow-up adjustment: {follow_up[:120]}")
-    result = app.invoke(state)
+    run_id = state.get("run_id") or new_run_id()
+    state["run_id"] = run_id
+    asyncio.run(_persist_cli_run(run_id, state))
+
+    result = app.invoke(state, config=_graph_config(run_id))
+    result["run_id"] = run_id
+    asyncio.run(_persist_cli_run(run_id, result))
     print_final_result(result)
+    print(f"Run saved: {run_id}")
 
     out_path = args.state_out or args.state_in
     save_task_state(out_path, result)

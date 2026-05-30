@@ -30,7 +30,9 @@ from agent_graph.repo_clone import clone_repository, reset_repo_to_baseline
 DEFAULT_SERVER_IMAGE = "ghcr.io/openhands/agent-server:1.21.1-python"
 LLM_ENV_KEYS = ("LLM_MODEL", "LLM_API_KEY", "LLM_BASE_URL")
 DEFAULT_PLANNER_MAX_ITERATIONS = 20
-DEFAULT_EXECUTOR_MAX_ITERATIONS = 500
+DEFAULT_EXECUTOR_MAX_ITERATIONS = 120
+DEFAULT_EXECUTOR_SIMPLE_MAX_ITERATIONS = 60
+DEFAULT_EXECUTOR_COMPLEX_MAX_ITERATIONS = 500
 
 
 def reuse_agent_server() -> bool:
@@ -140,6 +142,12 @@ class OpenHandsClient:
         if raw.isdigit():
             return int(raw)
         return DEFAULT_EXECUTOR_MAX_ITERATIONS
+
+    @staticmethod
+    def resolve_executor_max_iterations(max_iterations: int | None) -> int:
+        if max_iterations is not None and max_iterations > 0:
+            return max_iterations
+        return OpenHandsClient._executor_max_iterations()
 
     def _prepare_repo(
         self,
@@ -292,6 +300,9 @@ class OpenHandsClient:
         follow_up: bool = False,
         follow_up_prompt: str = "",
         diff_stat: str = "",
+        max_iterations: int | None = None,
+        expected_targets: list[str] | None = None,
+        scoped_plan: str | None = None,
     ) -> ExecutionResult:
         try:
             repo_path, base = self._prepare_repo(
@@ -316,7 +327,14 @@ class OpenHandsClient:
                 input_prompt=input_prompt,
             )
         else:
-            prompt = self._build_prompt(issue, plan, workspace_dir, input_prompt=input_prompt)
+            effective_plan = scoped_plan if scoped_plan else plan
+            prompt = self._build_prompt(
+                issue,
+                effective_plan,
+                workspace_dir,
+                input_prompt=input_prompt,
+                expected_targets=expected_targets,
+            )
 
         try:
             return self._execute_in_docker_workspace(
@@ -327,6 +345,7 @@ class OpenHandsClient:
                 mode="execution",
                 skip_health_checks=skip_health_checks or session is not None,
                 session=session,
+                max_iterations=max_iterations,
             )
         except Exception as e:
             return ExecutionResult(
@@ -468,8 +487,12 @@ class OpenHandsClient:
         workspace_dir: str,
         *,
         input_prompt: str = "",
+        expected_targets: list[str] | None = None,
     ) -> str:
+        from agent_graph.repo_execution_policy import build_discovery_instructions
+
         task = self._format_task_for_prompt(issue, input_prompt)
+        discovery = build_discovery_instructions(list(expected_targets or []))
         if workspace_dir != "/workspace":
             repo_instruction = f"Work in the repository at: {workspace_dir}"
         else:
@@ -497,6 +520,7 @@ class OpenHandsClient:
         numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
         return (
             f"# Task\n\nIssue: {task}\n\n"
+            f"{discovery}\n"
             f"# Implementation Plan\n\n{plan}\n\n"
             f"# Instructions\n\n"
             f"{numbered}\n\n"
@@ -660,6 +684,7 @@ class OpenHandsClient:
         skip_health_checks: bool = False,
         check_changes: bool = True,
         session: AgentServerSession | None = None,
+        max_iterations: int | None = None,
     ) -> ExecutionResult:
         label = "Planner / OpenHands" if mode == "planning" else "Executor / OpenHands"
 
@@ -676,6 +701,7 @@ class OpenHandsClient:
                     mode=mode,
                     label=label,
                     check_changes=check_changes,
+                    max_iterations=max_iterations,
                 )
             except ConversationRunError as e:
                 return ExecutionResult(
@@ -728,6 +754,7 @@ class OpenHandsClient:
                     label=label,
                     check_changes=check_changes,
                     skip_container_health_check=skip_health_checks,
+                    max_iterations=max_iterations,
                 )
         except ConversationRunError as e:
             return ExecutionResult(
@@ -751,16 +778,16 @@ class OpenHandsClient:
         label: str,
         check_changes: bool = True,
         skip_container_health_check: bool = False,
+        max_iterations: int | None = None,
     ) -> ExecutionResult:
-        max_iterations = (
-            self._planner_max_iterations()
-            if mode == "planning"
-            else self._executor_max_iterations()
-        )
+        if mode == "planning":
+            resolved_iterations = self._planner_max_iterations()
+        else:
+            resolved_iterations = self.resolve_executor_max_iterations(max_iterations)
         container_llm_url = self.llm_base_url_in_container
         debug(f"  Workspace dir: {workspace_dir}")
         debug(f"  LLM (container): {container_llm_url}")
-        step(f"  {label}: {mode} (max_iterations={max_iterations})")
+        step(f"  {label}: {mode} (max_iterations={resolved_iterations})")
 
         if not skip_container_health_check and not self._check_llm_health_in_container(
             workspace
@@ -809,7 +836,7 @@ class OpenHandsClient:
             conversation = Conversation(
                 agent=agent,
                 workspace=workspace,
-                max_iteration_per_run=max_iterations,
+                max_iteration_per_run=resolved_iterations,
                 stuck_detection=False,
                 visualizer=None,
             )

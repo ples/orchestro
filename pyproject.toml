@@ -15,13 +15,14 @@ dependencies = [
     "pydantic>=2.0",
     "python-dotenv>=1.0",
     "openai>=1.0",
-    "aiosqlite>=0.19",
+    "asyncpg>=0.30.0",
     "aiogram>=3.0.0",
     "aiohttp>=3.9.0",
     "openhands-sdk==1.21.1",
     "openhands-tools==1.21.1",
     "openhands-workspace==1.21.1",
     "langchain-mcp-adapters>=0.1.0",
+    "langgraph-checkpoint-postgres>=2.0.0",
     "mcp>=1.0",
 ]
 

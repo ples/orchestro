@@ -86,3 +86,34 @@ def test_build_graph_compiles():
 
     result = graph.invoke(state)
     assert result["pr_url"] == "https://github.com/o/r/pull/1"
+
+
+def test_build_graph_without_checkpointer_when_no_db_url():
+    with patch.dict("os.environ", {"LANGGRAPH_CHECKPOINT_DB_URL": "", "RUNS_DB_URL": ""}):
+        graph = build_graph()
+    assert graph is not None
+
+
+def test_build_graph_with_checkpointer():
+    class FakeCheckpointer:
+        def __init__(self):
+            self.setup_calls = 0
+
+        def setup(self):
+            self.setup_calls += 1
+
+    fake = FakeCheckpointer()
+    with (
+        patch.dict(
+            "os.environ",
+            {"LANGGRAPH_CHECKPOINT_DB_URL": "postgresql://u:p@localhost:5432/db"},
+            clear=False,
+        ),
+        patch(
+            "langgraph.checkpoint.postgres.PostgresSaver.from_conn_string",
+            return_value=fake,
+        ),
+    ):
+        graph = build_graph()
+    assert graph is not None
+    assert fake.setup_calls == 1

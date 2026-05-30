@@ -12,6 +12,7 @@ from agent_graph.openhands_client import (
     reuse_agent_server,
 )
 from agent_graph.repo_clone import clone_planner_workspace
+from agent_graph.repo_execution_policy import apply_execution_contract
 from agent_graph.state import RepoRecord, TaskState, format_agent_task
 
 from .base import BaseAgent
@@ -121,7 +122,7 @@ class PlannerAgent(BaseAgent):
                 if url:
                     record["repo_summary"] = f"Clone failed: {exc}"
                 updated.append(record)
-            return updated
+            return apply_execution_contract(updated, input_prompt=input_prompt)
 
         prepared: list[tuple[RepoRecord, str, str, str]] = []
         for repo_record in target_repos:
@@ -140,7 +141,9 @@ class PlannerAgent(BaseAgent):
             prepared.append((record, url, clone_path, baseline))
 
         if not prepared:
-            return updated
+            return apply_execution_contract(
+                updated, cross_repo_context="", input_prompt=input_prompt
+            )
 
         step(f"\n  [Planner] phase 2: scanning {len(prepared)} repositories")
         repo_scans: dict[str, str] = {}
@@ -227,7 +230,10 @@ class PlannerAgent(BaseAgent):
             if session is not None:
                 session.stop()
 
-        return updated
+        cross_ctx = big_picture or ""
+        return apply_execution_contract(
+            updated, cross_repo_context=cross_ctx, input_prompt=input_prompt
+        )
 
     @staticmethod
     def _build_combined_repo_context(

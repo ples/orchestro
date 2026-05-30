@@ -4,10 +4,12 @@ from unittest.mock import MagicMock, patch
 
 from agent_graph.agents.executor_loop import (
     ExecutorLoopAgent,
+    _execute_repo_with_retry,
     _repo_work_path,
     _run_single,
 )
 from agent_graph.models import ExecutionResult
+from agent_graph.pr_skip import NO_CHANGES_SKIP, REQUIRED_CHANGES_MISSING
 from agent_graph.state import TaskState
 
 
@@ -29,6 +31,9 @@ def test_executor_loop_passes_planner_clone(mock_run_single, _mock_health):
         "planner_clone_path": "/tmp/planner_repo_abc/admin-ui",
         "repo_baseline_sha": "sha1",
         "work_repo_path": "/tmp/planner_repo_abc/admin-ui",
+        "change_stat": "1 file changed",
+        "pr_error": "",
+        "pr_skip_reason": "",
     }
 
     state = _make_state(
@@ -38,6 +43,7 @@ def test_executor_loop_passes_planner_clone(mock_run_single, _mock_health):
                 "planner_clone_path": "/tmp/planner_repo_abc/admin-ui",
                 "repo_baseline_sha": "sha1",
                 "repo_summary": "## Findings\nBug in component",
+                "requires_changes": True,
             }
         ]
     )
@@ -68,11 +74,12 @@ def test_run_single_reuses_existing_path(mock_run_task):
     updated = _run_single(
         target_repo=record["target_repo_path"],
         issue="Fix bug",
-        plan="plan",
+        scoped_plan="plan",
         repo_record=record,
         existing_repo_path=record["planner_clone_path"],
         baseline_sha=record["repo_baseline_sha"],
         skip_health_checks=True,
+        force_openhands=True,
     )
 
     mock_run_task.assert_called_once()
@@ -100,15 +107,100 @@ def test_run_single_no_changes_sets_skip_not_error(mock_run_task):
     updated = _run_single(
         target_repo=record["target_repo_path"],
         issue="Fix bug",
-        plan="plan",
+        scoped_plan="plan",
         repo_record=record,
         existing_repo_path=record["planner_clone_path"],
         baseline_sha=record["repo_baseline_sha"],
         skip_health_checks=True,
+        force_openhands=True,
     )
 
-    assert updated.get("pr_skip_reason") == "no_changes"
+    assert updated.get("pr_skip_reason") == NO_CHANGES_SKIP
     assert updated.get("pr_error", "") == ""
+
+
+@patch("agent_graph.agents.executor_loop._run_single")
+def test_execute_repo_with_retry_fails_after_two_no_ops(mock_run_single):
+    no_op = {
+        "target_repo_path": "https://bitbucket.org/team/admin-ui.git",
+        "pr_skip_reason": REQUIRED_CHANGES_MISSING,
+        "pr_error": "",
+        "repo_summary": "No file changes",
+    }
+    mock_run_single.side_effect = [no_op, no_op]
+
+    record = {
+        "target_repo_path": "https://bitbucket.org/team/admin-ui.git",
+        "requires_changes": True,
+        "expected_targets": ["src/components/GroupDetails.tsx"],
+    }
+    updated = _execute_repo_with_retry(
+        target_repo=record["target_repo_path"],
+        issue="Fix bug",
+        scoped_plan="plan",
+        repo_record=record,
+        skip_health_checks=True,
+    )
+    assert mock_run_single.call_count == 2
+    assert "Required changes missing" in updated.get("pr_error", "")
+    assert updated.get("pr_skip_reason", "") == ""
+    assert updated.get("execution_diagnostics")
+
+
+@patch("agent_graph.agents.executor_loop._run_single")
+def test_execute_repo_with_retry_succeeds_on_second_attempt(mock_run_single):
+    no_op = {
+        "target_repo_path": "https://bitbucket.org/team/admin-ui.git",
+        "pr_skip_reason": REQUIRED_CHANGES_MISSING,
+        "change_stat": "",
+    }
+    success = {
+        "target_repo_path": "https://bitbucket.org/team/admin-ui.git",
+        "change_stat": "1 file changed",
+        "pr_error": "",
+        "pr_skip_reason": "",
+    }
+    mock_run_single.side_effect = [no_op, success]
+
+    record = {
+        "target_repo_path": "https://bitbucket.org/team/admin-ui.git",
+        "requires_changes": True,
+    }
+    updated = _execute_repo_with_retry(
+        target_repo=record["target_repo_path"],
+        issue="Fix bug",
+        scoped_plan="plan",
+        repo_record=record,
+        skip_health_checks=True,
+    )
+    assert mock_run_single.call_count == 2
+    assert updated.get("change_stat") == "1 file changed"
+
+
+@patch("agent_graph.openhands_client.OpenHandsClient.run_task")
+def test_run_single_required_no_changes_marks_retryable(mock_run_task):
+    mock_run_task.return_value = ExecutionResult(
+        success=True,
+        no_changes=True,
+        summary="No file changes in admin-ui",
+        work_repo_path="/tmp/repo",
+        repo_baseline_sha="sha1",
+    )
+    record = {
+        "target_repo_path": "https://bitbucket.org/team/admin-ui.git",
+        "requires_changes": True,
+        "expected_targets": ["GroupDetails.tsx"],
+    }
+    updated = _run_single(
+        target_repo=record["target_repo_path"],
+        issue="Fix",
+        scoped_plan="plan",
+        repo_record=record,
+        skip_health_checks=True,
+        force_openhands=True,
+    )
+    assert updated.get("pr_skip_reason") == REQUIRED_CHANGES_MISSING
+    assert updated.get("execution_diagnostics")
 
 
 @patch("agent_graph.openhands_client.OpenHandsClient.check_runtime_ready", return_value="Docker down")
@@ -119,6 +211,7 @@ def test_executor_skips_when_runtime_unavailable(mock_run_single, _mock_health):
             {
                 "target_repo_path": "https://bitbucket.org/team/admin-ui.git",
                 "planner_clone_path": "/tmp/repo",
+                "requires_changes": True,
             }
         ]
     )
@@ -152,6 +245,7 @@ def test_executor_loop_follow_up_uses_work_path(mock_run_single, _mock_health):
                 "planner_clone_path": "/tmp/planner",
                 "work_repo_path": "/tmp/work",
                 "repo_baseline_sha": "sha1",
+                "requires_changes": True,
             }
         ],
     )
@@ -161,3 +255,32 @@ def test_executor_loop_follow_up_uses_work_path(mock_run_single, _mock_health):
     assert call_kw["follow_up"] is True
     assert call_kw["follow_up_prompt"] == "Make button blue"
     assert result.get("iteration") == 1
+
+
+@patch("agent_graph.openhands_client.OpenHandsClient.check_runtime_ready", return_value=None)
+@patch("agent_graph.agents.executor_loop._run_single")
+def test_executor_skips_repo_without_required_changes(mock_run_single, _mock_health):
+    state = _make_state(
+        target_repos=[
+            {
+                "target_repo_path": "https://bitbucket.org/dmetrics/identity-hub-api.git",
+                "planner_clone_path": "/tmp/identity-hub-api",
+                "requires_changes": False,
+            },
+            {
+                "target_repo_path": "https://bitbucket.org/dmetrics/admin-ui.git",
+                "planner_clone_path": "/tmp/admin-ui",
+                "requires_changes": True,
+            },
+        ]
+    )
+    mock_run_single.return_value = {
+        "work_repo_path": "/tmp/admin-ui",
+        "change_stat": "1 file changed",
+        "pr_error": "",
+        "pr_skip_reason": "",
+    }
+    result = ExecutorLoopAgent().run(state)
+    mock_run_single.assert_called_once()
+    assert result["target_repos"][0]["pr_skip_reason"] == NO_CHANGES_SKIP
+    assert result["target_repos"][0].get("execution_mode") == "skip"

@@ -15,6 +15,7 @@ from agent_graph.git_utils import (
 from agent_graph.deploy_env import prepare_deploy_env_tag, refresh_deploy_env_tag_at_head
 from agent_graph.pr_skip import (
     NO_CHANGES_SKIP,
+    REQUIRED_CHANGES_MISSING,
     format_no_changes_skip,
     is_no_changes_summary,
 )
@@ -38,6 +39,7 @@ class PrAggregatorAgent(BaseAgent):
         all_skips: list[str] = []
         all_deploy_tags: list[str] = []
         all_deploy_tag_errors: list[str] = []
+        all_push_modes: list[str] = []
         updated_repos: list[RepoRecord] = []
 
         print(f"\n[PR Aggregator] Creating PRs for {len(target_repos)} repository(ies)...")
@@ -48,6 +50,17 @@ class PrAggregatorAgent(BaseAgent):
             skip_reason = repo.get("pr_skip_reason", "")
             pr_err = repo.get("pr_error", "")
 
+            if skip_reason == REQUIRED_CHANGES_MISSING:
+                msg = pr_err or f"Required changes missing in {target}"
+                repo_out["pr_error"] = msg
+                repo_out["pr_skip_reason"] = ""
+                all_errors.append(f"{target}: {msg}")
+                updated_repos.append(repo_out)
+                continue
+            if pr_err and "required changes missing" in pr_err.lower():
+                all_errors.append(f"{target}: {pr_err}")
+                updated_repos.append(repo_out)
+                continue
             if skip_reason == NO_CHANGES_SKIP or is_no_changes_summary(skip_reason):
                 repo_out["pr_skip_reason"] = NO_CHANGES_SKIP
                 repo_out["pr_error"] = ""
@@ -83,6 +96,7 @@ class PrAggregatorAgent(BaseAgent):
                 all_errors.append(f"{target}: {pr_err}")
             tag_name = pr_result.get("deploy_tag_name", "")
             tag_err = pr_result.get("deploy_tag_error", "")
+            push_mode = pr_result.get("pr_push_mode", "")
             pr_branch = pr_result.get("pr_branch", "")
             if pr_branch:
                 repo_out["pr_branch"] = pr_branch
@@ -92,6 +106,9 @@ class PrAggregatorAgent(BaseAgent):
             if tag_err:
                 repo_out["deploy_tag_error"] = tag_err
                 all_deploy_tag_errors.append(f"{target}: {tag_err}")
+            if push_mode:
+                repo_out["pr_push_mode"] = push_mode
+                all_push_modes.append(f"{target}: {push_mode}")
             updated_repos.append(repo_out)
 
         if all_pull_urls:
@@ -112,6 +129,7 @@ class PrAggregatorAgent(BaseAgent):
             "pr_skip_reason": "\n".join(all_skips) if all_skips else "",
             "deploy_tag_name": "\n".join(all_deploy_tags),
             "deploy_tag_error": "\n".join(all_deploy_tag_errors),
+            "pr_push_mode": "\n".join(all_push_modes),
         }
 
     # -- per-repo PR creation ------------------------------------------------
@@ -185,7 +203,7 @@ class PrAggregatorAgent(BaseAgent):
             tag_fields = self._prepare_deploy_env_tag(state, work_repo, branch)
             if tag_fields.get("deploy_tag_error"):
                 return {"pr_url": "", "pr_error": tag_fields["deploy_tag_error"], **tag_fields}
-            self._push_branch(
+            push_mode = self._push_branch(
                 work_repo,
                 branch,
                 deploy_tag_name=tag_fields.get("deploy_tag_name") or None,
@@ -214,7 +232,13 @@ class PrAggregatorAgent(BaseAgent):
                 return {"pr_url": existing, "pr_error": "", **tag_fields}
             return {"pr_url": "", "pr_error": f"PR API error: {e}", **tag_fields}
 
-        return {"pr_url": pr_url, "pr_error": "", "pr_branch": branch, **tag_fields}
+        return {
+            "pr_url": pr_url,
+            "pr_error": "",
+            "pr_branch": branch,
+            "pr_push_mode": push_mode,
+            **tag_fields,
+        }
 
     # -- Bitbucket PR --------------------------------------------------------
 
@@ -257,7 +281,7 @@ class PrAggregatorAgent(BaseAgent):
             tag_fields = self._prepare_deploy_env_tag(state, work_repo, branch)
             if tag_fields.get("deploy_tag_error"):
                 return {"pr_url": "", "pr_error": tag_fields["deploy_tag_error"], **tag_fields}
-            self._push_branch(
+            push_mode = self._push_branch(
                 work_repo,
                 branch,
                 deploy_tag_name=tag_fields.get("deploy_tag_name") or None,
@@ -278,7 +302,13 @@ class PrAggregatorAgent(BaseAgent):
         except RuntimeError as e:
             return {"pr_url": "", "pr_error": f"PR API error: {e}", **tag_fields}
 
-        return {"pr_url": pr_url, "pr_error": "", "pr_branch": branch, **tag_fields}
+        return {
+            "pr_url": pr_url,
+            "pr_error": "",
+            "pr_branch": branch,
+            "pr_push_mode": push_mode,
+            **tag_fields,
+        }
 
     # -- Shared helpers ------------------------------------------------------
 
@@ -386,7 +416,12 @@ class PrAggregatorAgent(BaseAgent):
         *,
         deploy_tag_name: str | None = None,
         deploy_env: str = "",
-    ) -> None:
+    ) -> str:
+        allow_hard_force = (
+            os.getenv("PR_ALLOW_HARD_FORCE_PUSH", "1").strip().lower()
+            in ("1", "true", "yes")
+        )
+
         def _push_refs(*extra_args: str) -> None:
             refs: list[str] = []
             if deploy_tag_name:
@@ -407,7 +442,8 @@ class PrAggregatorAgent(BaseAgent):
 
         try:
             _push_refs()
-            return
+            print(f"  Push mode: normal ({branch})")
+            return "normal"
         except subprocess.CalledProcessError as first_err:
             err = (
                 first_err.stderr.decode()
@@ -421,17 +457,32 @@ class PrAggregatorAgent(BaseAgent):
             self._git(work_repo, "rebase", f"origin/{branch}")
             _refresh_tag_after_rebase()
             _push_refs()
-            return
+            print(f"  Push mode: rebased ({branch})")
+            return "rebased"
         except subprocess.CalledProcessError:
             print(f"  Rebase onto origin/{branch} failed; pushing with --force-with-lease")
         self._git(work_repo, "fetch", "origin", branch)
         try:
             _refresh_tag_after_rebase()
             _push_refs("--force-with-lease")
+            print(f"  Push mode: force-with-lease ({branch})")
+            return "force-with-lease"
         except subprocess.CalledProcessError:
+            if not allow_hard_force:
+                raise subprocess.CalledProcessError(
+                    1,
+                    ["git", "push", "--force"],
+                    None,
+                    (
+                        f"Force push blocked for {branch}; set PR_ALLOW_HARD_FORCE_PUSH=1 "
+                        "to allow hard-force fallback."
+                    ).encode(),
+                )
             print(f"  Force-with-lease push failed; using --force for {branch}")
             _refresh_tag_after_rebase()
             _push_refs("--force")
+            print(f"  Push mode: force ({branch})")
+            return "force"
 
     @staticmethod
     def _gh_title(issue_text: str, issue_number: int | None) -> str:

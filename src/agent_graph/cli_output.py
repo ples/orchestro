@@ -66,6 +66,7 @@ def format_final_result(state: TaskState) -> str:
             skip = r.get("pr_skip_reason", "")
             deploy_tag = r.get("deploy_tag_name", "")
             deploy_tag_err = r.get("deploy_tag_error", "")
+            push_mode = r.get("pr_push_mode", "")
             if pr:
                 status = f"  ✓ {pr}"
             elif err and not is_no_changes_summary(err):
@@ -83,6 +84,8 @@ def format_final_result(state: TaskState) -> str:
                 parts.append(f"tag: {deploy_tag}")
             if deploy_tag_err:
                 parts.append(f"tag error: {deploy_tag_err}")
+            if push_mode:
+                parts.append(f"push: {push_mode}")
             lines.append("  " + " | ".join(parts))
 
     impl = state.get("implementation_result", "")
@@ -136,8 +139,15 @@ def format_final_result(state: TaskState) -> str:
     deploy_tag_name = state.get("deploy_tag_name", "")
     deploy_tag_error = state.get("deploy_tag_error", "")
     deploy_env = state.get("deploy_env", "")
+    deploy_env_source = state.get("deploy_env_source", "")
+    pr_push_mode = state.get("pr_push_mode", "")
     if deploy_env:
-        lines.append(_paint("Deploy env", _C.BOLD) + f"  {deploy_env}")
+        if deploy_env_source:
+            lines.append(
+                _paint("Deploy env", _C.BOLD) + f"  {deploy_env} ({deploy_env_source})"
+            )
+        else:
+            lines.append(_paint("Deploy env", _C.BOLD) + f"  {deploy_env}")
     if deploy_tag_name:
         lines.append(_paint("✓ Deploy tag pushed", _C.BOLD, _C.GREEN))
         for tag_line in deploy_tag_name.split("\n"):
@@ -146,6 +156,8 @@ def format_final_result(state: TaskState) -> str:
         lines.append(_paint("✗ Deploy tag failed", _C.BOLD, _C.RED))
         for tag_err_line in deploy_tag_error.split("\n"):
             lines.append(f"  {tag_err_line}")
+    if pr_push_mode:
+        lines.append(_paint("Push mode", _C.BOLD) + f"  {pr_push_mode}")
 
     lines.append(sep)
     lines.append("")

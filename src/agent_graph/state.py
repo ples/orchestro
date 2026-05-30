@@ -32,6 +32,13 @@ class RepoRecord(TypedDict, total=False):
     deploy_tag_error: str
     repo_summary: str
     pr_branch: str
+    requires_changes: bool
+    expected_targets: list[str]
+    execution_diagnostics: str
+    execution_profile: str
+    execution_mode: str
+    discovery_context: str
+    pr_push_mode: str
 
 
 class TaskState(TypedDict, total=False):
@@ -58,9 +65,12 @@ class TaskState(TypedDict, total=False):
     pr_error: str  # aggregated (multi-line) PR errors
     pr_skip_reason: str  # aggregated (multi-line) PR skip reasons
     deploy_env: str
+    deploy_env_source: str
     deploy_tag_name: str  # aggregated deploy env tag names
     deploy_tag_error: str  # aggregated deploy tag errors
+    pr_push_mode: str  # aggregated per-repo push strategy summary
     chat_id: str
+    run_id: str
     workflow_node: WorkflowNodeType
     error_message: str
     repo_context: str

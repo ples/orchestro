@@ -1,8 +1,12 @@
 from collections.abc import Callable
+import os
 
 from langgraph.graph import END, StateGraph
 
 from agent_graph.state import TaskState, is_follow_up_mode
+
+_checkpointer = None
+_checkpointer_ready = False
 
 
 def build_graph(
@@ -14,10 +18,8 @@ def build_graph(
     executor_loop_fn: Callable[[TaskState], dict] | None = None,
     plan_adjuster_fn: Callable[[TaskState], dict] | None = None,
     source_platform: str = "github",
-) -> StateGraph:
+):
     graph = StateGraph(TaskState)
-
-    needs_repo_resolver = source_platform in ("jira", "bitbucket")
 
     planner = planner_fn or _default_planner
     executor_loop = executor_loop_fn or _default_executor_loop
@@ -31,19 +33,21 @@ def build_graph(
     graph.add_node("verifier", verifier)
     graph.add_node("pr_aggregator", pr_creator)
 
+    # Always include repo_resolver in the graph to allow dynamic routing
+    repo_resolver = repo_resolver_fn or _default_repo_resolver
+    graph.add_node("repo_resolver", repo_resolver)
+
     entry_targets: dict[str, str] = {
         "plan_adjuster": "plan_adjuster",
         "planner": "planner",
+        "repo_resolver": "repo_resolver",
     }
-    if needs_repo_resolver:
-        repo_resolver = repo_resolver_fn or _default_repo_resolver
-        graph.add_node("repo_resolver", repo_resolver)
-        entry_targets["repo_resolver"] = "repo_resolver"
-        graph.add_conditional_edges(
-            "repo_resolver",
-            lambda _s: "planner",
-            {"planner": "planner"},
-        )
+
+    graph.add_conditional_edges(
+        "repo_resolver",
+        lambda _s: "planner",
+        {"planner": "planner"},
+    )
 
     graph.set_conditional_entry_point(
         _make_entry_router(source_platform),
@@ -61,14 +65,46 @@ def build_graph(
         {"done": END, "failed": END},
     )
 
-    return graph.compile()
+    checkpointer = _get_checkpointer()
+    return graph.compile(checkpointer=checkpointer) if checkpointer else graph.compile()
+
+
+def _build_postgres_url() -> str:
+    host = os.getenv("POSTGRES_HOST", "127.0.0.1").strip()
+    port = os.getenv("POSTGRES_PORT", "5432").strip()
+    db = os.getenv("POSTGRES_DB", "agent_graph").strip()
+    user = os.getenv("POSTGRES_USER", "agent_graph").strip()
+    password = os.getenv("POSTGRES_PASSWORD", "agent_graph").strip()
+    return f"postgresql://{user}:{password}@{host}:{port}/{db}"
+
+
+def _get_checkpointer():
+    global _checkpointer, _checkpointer_ready
+    db_url = (
+        os.getenv("LANGGRAPH_CHECKPOINT_DB_URL", "").strip()
+        or os.getenv("RUNS_DB_URL", "").strip()
+    )
+    if not db_url:
+        # Keep unit tests and lightweight local runs working without DB.
+        return None
+
+    if _checkpointer is None:
+        from langgraph.checkpoint.postgres import PostgresSaver
+
+        _checkpointer = PostgresSaver.from_conn_string(db_url or _build_postgres_url())
+    if not _checkpointer_ready:
+        _checkpointer.setup()
+        _checkpointer_ready = True
+    return _checkpointer
 
 
 def _make_entry_router(source_platform: str):
     def _entry_router(state: TaskState) -> str:
         if is_follow_up_mode(state):
             return "plan_adjuster"
-        if source_platform in ("jira", "bitbucket"):
+        # Determine platform dynamically based on state, falling back to graph static configuration
+        platform = state.get("source_platform", source_platform)
+        if platform in ("jira", "bitbucket"):
             return "repo_resolver"
         return "planner"
 
@@ -138,4 +174,7 @@ def _default_pr_creator(state: TaskState) -> dict:
 def _pr_router(state: TaskState) -> str:
     if state.get("pr_error"):
         return "failed"
+    for repo in state.get("target_repos") or []:
+        if (repo.get("pr_error") or "").strip():
+            return "failed"
     return "done"

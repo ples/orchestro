@@ -4,6 +4,7 @@ import subprocess
 from unittest.mock import patch
 
 from agent_graph.agents.pr_aggregator import PrAggregatorAgent
+from agent_graph.pr_skip import NO_CHANGES_SKIP, REQUIRED_CHANGES_MISSING
 from agent_graph.state import TaskState
 
 
@@ -55,6 +56,40 @@ class TestPrAggregatorNoChanges:
         assert "identity-hub-api.git" in result.get("pr_skip_reason", "")
         assert "account-ui.git" in result.get("pr_skip_reason", "")
         assert "No changes required" in result.get("pr_skip_reason", "")
+
+    def test_required_changes_missing_treated_as_error(self):
+        agent = PrAggregatorAgent()
+        state: TaskState = {
+            "target_repos": [
+                {
+                    "target_repo_path": "https://bitbucket.org/dmetrics/admin-ui.git",
+                    "work_repo_path": "/tmp/admin-ui",
+                    "repo_baseline_sha": "abc",
+                    "pr_skip_reason": REQUIRED_CHANGES_MISSING,
+                    "pr_error": "Required changes missing in admin-ui",
+                },
+            ],
+        }
+        result = agent.run(state)
+        assert "admin-ui.git" in result.get("pr_error", "")
+        assert REQUIRED_CHANGES_MISSING not in result.get("pr_skip_reason", "")
+
+    def test_optional_no_changes_still_skipped(self):
+        agent = PrAggregatorAgent()
+        state: TaskState = {
+            "target_repos": [
+                {
+                    "target_repo_path": "https://bitbucket.org/dmetrics/identity-hub-api.git",
+                    "work_repo_path": "/tmp/identity-hub-api",
+                    "repo_baseline_sha": "abc",
+                    "requires_changes": False,
+                    "pr_skip_reason": NO_CHANGES_SKIP,
+                },
+            ],
+        }
+        result = agent.run(state)
+        assert result.get("pr_error", "") == ""
+        assert "identity-hub-api.git" in result.get("pr_skip_reason", "")
 
 
 class TestPrAggregatorDeployTag:
@@ -122,12 +157,36 @@ class TestPrAggregatorDeployTag:
             calls.append(list(args))
 
         agent._git = capture_git  # type: ignore[method-assign]
-        agent._push_branch(
+        mode = agent._push_branch(
             str(repo),
             "main",
             deploy_tag_name="env.dev.branch.main",
         )
+        assert mode == "normal"
         assert calls
         assert calls[0][0] == "push"
         assert "env.dev.branch.main" in calls[0]
         assert "main" in calls[0]
+
+    def test_push_branch_blocks_hard_force_when_disabled(self):
+        agent = PrAggregatorAgent()
+        call_counter = {"push": 0}
+
+        def fake_git(_repo_path, *args):
+            if args[0] == "push":
+                call_counter["push"] += 1
+                raise subprocess.CalledProcessError(
+                    1, ["git", "push"], None, b"rejected"
+                )
+            if args[0] == "rebase":
+                raise subprocess.CalledProcessError(1, ["git", "rebase"], None, b"fail")
+
+        agent._git = fake_git  # type: ignore[method-assign]
+        with patch("agent_graph.agents.pr_aggregator.refresh_deploy_env_tag_at_head", return_value=""):
+            with patch("agent_graph.agents.pr_aggregator.os.getenv", return_value="0"):
+                try:
+                    agent._push_branch("/tmp/repo", "main")
+                    assert False, "expected CalledProcessError"
+                except subprocess.CalledProcessError as exc:
+                    assert b"Force push blocked" in exc.stderr
+                    assert call_counter["push"] >= 2

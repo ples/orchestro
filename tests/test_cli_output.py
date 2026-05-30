@@ -42,3 +42,23 @@ def test_format_no_changes_shows_skip_not_failed():
     assert "PR creation skipped" in text
     assert "PR creation failed" not in text
     assert "No changes required" in text
+
+
+def test_format_includes_deploy_env_source_and_push_mode():
+    text = format_final_result(
+        {
+            "issue": "MINSKY-2",
+            "deploy_env": "dev2",
+            "deploy_env_source": "prompt/issue",
+            "pr_push_mode": "repo-a: rebased",
+            "target_repos": [
+                {
+                    "target_repo_path": "https://bitbucket.org/dmetrics/admin-ui.git",
+                    "pr_push_mode": "rebased",
+                }
+            ],
+        }
+    )
+    assert "dev2 (prompt/issue)" in text
+    assert "Push mode" in text
+    assert "push: rebased" in text

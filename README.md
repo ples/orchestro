@@ -35,7 +35,30 @@ pip install -e .
 
 This builds `agent_graph` from source, so any code change is reflected immediately.
 
-#### 3. Run the workflow
+#### 3. Start PostgreSQL (required for run history + LangGraph checkpoints)
+
+```bash
+docker compose up -d postgres
+```
+
+Default local credentials (see `.env.example`):
+
+- `POSTGRES_HOST=127.0.0.1`
+- `POSTGRES_PORT=5432`
+- `POSTGRES_DB=agent_graph`
+- `POSTGRES_USER=agent_graph`
+- `POSTGRES_PASSWORD=agent_graph`
+
+Recommended DSN configuration:
+
+```bash
+export RUNS_DB_URL="postgresql://agent_graph:agent_graph@127.0.0.1:5432/agent_graph"
+export LANGGRAPH_CHECKPOINT_DB_URL="$RUNS_DB_URL"
+```
+
+If `RUNS_DB_URL` is not set, the app builds a DSN from `POSTGRES_*` values.
+
+#### 4. Run the workflow
 
 ```bash
 python -m agent_graph.main
@@ -91,11 +114,23 @@ python -m agent_graph.main \
 
 The tag format is `env.{env}.branch.{branch}` (e.g. `env.dev.branch.hotfix/my-fix`). The tag is created at the commit HEAD and pushed in the same `git push` as the branch so CI/CD sees it when the branch webhook fires. You can also set `DEPLOY_ENV` in `.env` or infer the environment from `--prompt` / issue text (e.g. `deploy to stage`).
 
-#### 4. Install dev dependencies and run tests
+#### 5. Install dev dependencies and run tests
 
 ```bash
 pip install -e ".[dev]"
 python -m pytest tests/ -v
+```
+
+### PostgreSQL Persistence Notes
+
+- Workflow run history is stored in PostgreSQL table `workflow_runs`.
+- LangGraph checkpointer state is stored in PostgreSQL (via `langgraph-checkpoint-postgres`).
+- Existing SQLite data is not migrated; this setup starts fresh on PostgreSQL.
+- If startup fails with connection errors, check DB health:
+
+```bash
+docker compose ps postgres
+docker compose logs postgres
 ```
 
 ### Programmatic API
@@ -183,12 +218,21 @@ You should see `Telegram bot started in polling mode` in the logs. If `TELEGRAM_
 ### 4. Use in Telegram Messenger
 
 1. Open your bot in Telegram (use the link from BotFather or search by username).
-2. Send `/start` — the bot replies: *Ready! Send me an issue to work on.*
-3. Send a task as a plain-text message, for example:
+2. Send `/start` — the bot resets your session and is ready for a new task.
+3. Send `/help` for commands, workflow tips, and button reference.
+4. Send a task as a plain-text message, for example:
   - `Add JWT authentication to FastAPI backend`
   - `https://company.atlassian.net/browse/MINSKY-123`
-4. The bot updates one status message as the workflow progresses: **Planning** → **Executing** → **Verifying** → **Creating pull request**.
-5. When finished, you get the PR link, a skip reason, or an error message.
+5. The bot updates one status message as the workflow progresses: **Planning** → **Executing** → **Verifying** → **Creating pull request**.
+6. When finished, you get the PR link, a skip reason, or an error message.
+
+**Commands**
+
+- `/start` — Reset session and start a new task
+- `/help` — Show help (commands, workflow, buttons)
+- `/history` — List recent runs for this chat (alias: `/runs`)
+
+**History & Q&A:** Use `/history` to browse past runs. Tap a run for details, **View Plan**, or **Ask Question** to ask about that run. Send questions as messages; tap **Exit Q&A** when done.
 
 **Inline buttons**
 
@@ -202,6 +246,17 @@ You should see `Telegram bot started in polling mode` in the logs. If `TELEGRAM_
 
 
 **Follow-up adjustments:** After completion, send another message with changes (e.g. `Use a blue button; add a unit test`) or tap **Adjust**. One adjustment pass is allowed per task; it reuses the existing branch and updates the PR. See [Follow-up adjustment](#follow-up-adjustment-one-iteration).
+
+**Natural language:** You can write freely — the bot classifies your intent:
+
+| Example | Intent |
+| ------- | ------ |
+| `Implement OAuth for admin-ui` | Start new work |
+| `What's the PR link for the JWT task?` | Ask about a past run |
+| `Make the login button blue on the last task` | Adjust a completed run |
+| `show my runs` | List history |
+
+If several runs match, the bot asks you to pick one. Sending a new task while a workflow is running cancels the current run and starts fresh.
 
 ## Graph Topology
 
@@ -224,7 +279,14 @@ Entry routing: `follow_up` mode skips planner/repo_resolver and starts at `plan_
 
 **Planner phase:** clones each detected repo, runs a static dependency scan, then OpenHands in Docker (read-only analysis) to produce per-repo `repo_summary` and an aggregated `plan`.
 
-**Executor phase:** reuses planner clones (`planner_clone_path`), resets git to baseline, then OpenHands implements the plan per repository.
+**Executor phase:** hybrid pipeline per repository:
+
+- Skips repos with `requires_changes=false` (no OpenHands run).
+- **Constrained path** for simple localized fixes: host-side discovery, local LLM patch, then git apply.
+- **OpenHands path** for standard/complex work (repo-scoped plan, discovery instructions, tiered `max_iterations`).
+- Required repos with no diff after one retry are marked failed (not silent success).
+
+**Verifier phase:** state checks plus optional repo tests/lint (`npm test`, `pytest`, etc.) when `VERIFIER_RUN_TESTS=1`.
 
 ### Follow-up adjustment (one iteration)
 
@@ -271,7 +333,7 @@ classDiagram
 - `pr_url` — URL of the created pull request (empty if skipped or failed).
 - `pr_error` — error message when PR creation failed.
 
-Optional env: `GIT_CLONE_TIMEOUT` (default 120s), `PLANNER_MAX_ITERATIONS` (default 80), `EXECUTOR_MAX_ITERATIONS` (default 500).
+Optional env: `GIT_CLONE_TIMEOUT` (default 120s), `PLANNER_MAX_ITERATIONS` (default 80), `EXECUTOR_MAX_ITERATIONS` (default 120), `EXECUTOR_SIMPLE_MAX_ITERATIONS` (60), `EXECUTOR_COMPLEX_MAX_ITERATIONS` (500), `EXECUTOR_CONSTRAINED_ENABLED` (1), `VERIFIER_RUN_TESTS` (1), `VERIFIER_SKIP_LINT` (0), `VERIFIER_BOOTSTRAP_DEPS` (0; auto-install JS deps before checks), `PR_ALLOW_HARD_FORCE_PUSH` (1; allow hard-force fallback by default, set `0` to block).
 
 Pydantic models keep structured payloads typed and validated:
 

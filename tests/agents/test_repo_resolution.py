@@ -216,6 +216,10 @@ class TestRepoResolverJira:
                 "agent_graph.agents.bitbucket_catalog.resolve_bitbucket_repo_url",
                 return_value=None,
             ),
+            patch(
+                "agent_graph.repo_llm_extractor.llm_repo_detect_enabled",
+                return_value=False,
+            ),
         ):
             result = RepoResolverAgent().run(state)
 

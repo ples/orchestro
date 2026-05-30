@@ -1,4 +1,20 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=agent_graph
+      - POSTGRES_USER=agent_graph
+      - POSTGRES_PASSWORD=agent_graph
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_graph -d agent_graph"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   openhands:
     image: docker.openhands.dev/openhands/openhands:1.7.0
     ports:
@@ -17,3 +33,4 @@ services:
 
 volumes:
   workspace:
+  postgres_data:
